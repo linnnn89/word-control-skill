@@ -30,6 +30,7 @@ Use this skill for current-document workflows:
 - If the selection is empty, treat replacement as insertion at the cursor and say so.
 - Do not close Word or kill Word processes unless they were created by a smoke test and have no visible document title.
 - Do not use this for cloud-only Word Online documents unless they are open in desktop Word and COM can access them.
+- At task close, clean Word Control scratch artifacts created only for the task, such as probe/status `*.json`, temporary input/output `*.txt`, equation/table scratch files, and other transient files. Preserve source documents, edited documents, explicit backups, and final review artifacts such as PDF/PNG previews unless the user explicitly asks to remove them.
 
 ## Script
 
@@ -155,6 +156,28 @@ cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_contr
 6. Run `replace-selection --track --yes`.
 7. Insert comments for unresolved evidence, wording, statistics, citations, or author decisions.
 8. Export PDF if layout verification matters.
+9. Clean task-local scratch files created by Word Control (`status.json`, `selection.txt`, table/equation probe files, temporary revision text, and similar intermediate `*.json`/`*.txt` artifacts). Do not delete user documents, backups, or final verification previews.
+
+## Cleanup Standard
+
+Before final response, list the Word Control scratch artifacts created during the task and remove those that are purely intermediate. Keep anything needed for audit, rollback, or user review:
+
+- Keep original `.docx` files and edited final documents.
+- Keep explicit backups made with `save-copy`.
+- Keep final PDF/PNG previews when they document visual QA.
+- Remove temporary status, selection, table, paragraph, equation, and revision files unless the user asked to keep them.
+- If a file's role is ambiguous, keep it and mention it instead of deleting it silently.
+
+## Paragraph Replacement Caution
+
+Known local issue: `replace-paragraph --index n` may behave like an insertion-plus-blanking operation in some Word documents rather than a clean in-place replacement. It can leave the old paragraph later in the document, create extra blank paragraphs, and shift subsequent paragraph indexes. Do not use `replace-paragraph` to delete paragraphs by replacing them with a blank file.
+
+Safer rules:
+
+- Prefer `replace-selection` for targeted prose edits after selecting the exact range in Word.
+- If `replace-paragraph` is used, rerun `paragraphs` immediately after each mutation and verify with `document-text --full` before making another indexed edit.
+- For generated DOCX drafts, prefer regenerating a clean DOCX, then use Word Control for `open`, `save-copy`, `export-pdf`, and text/layout verification rather than chaining many indexed paragraph replacements.
+- Always check for duplicated old text after paragraph operations, especially when correcting a heading/body pair or after clearing an earlier paragraph.
 
 ## Limitations
 

@@ -15,6 +15,7 @@ This public repository contains a Codex skill that lets Codex work with an open 
 - Create, inspect, edit, normalize, and delete Word tables.
 - Insert, edit, inspect, and delete Word equation objects from Word linear syntax or common LaTeX syntax.
 - Save the active document, save a backup copy, close the active document, and export PDF for visual review.
+- Clean task-only scratch files such as temporary `*.json` and `*.txt` probe outputs after the Word edit is complete.
 
 ## 功能概览
 
@@ -25,6 +26,7 @@ This public repository contains a Codex skill that lets Codex work with an open 
 - 创建、查看、编辑、统一边框和删除 Word 内置表格。
 - 从 Word 线性公式或常见 LaTeX 写法创建、编辑、查看和删除 Word 内置公式对象。
 - 保存当前文档、保存备份副本、关闭当前文档，并导出 PDF 进行视觉检查。
+- 完成 Word 修改后清理仅用于本次任务的临时 `*.json`、`*.txt` 等中间产物。
 
 ## Why This Exists
 
@@ -34,6 +36,7 @@ For local Word editing, the fastest workflow is often:
 2. Select the passage, table, or location to edit.
 3. Ask Codex to use `$word-control`.
 4. Let Codex save a backup, apply a narrow change, and export a PDF preview.
+5. Let Codex remove task-only scratch files while preserving the document, backup, and final review previews.
 
 This avoids unnecessary token use, temporary folders, and repeated new-document generation when the task is a small edit to an existing Word file.
 
@@ -45,6 +48,7 @@ This avoids unnecessary token use, temporary folders, and repeated new-document 
 2. 选中需要修改的文字、表格或插入位置。
 3. 让 Codex 使用 `$word-control`。
 4. 由 Codex 先备份，再做局部修改，最后导出 PDF 预览。
+5. 由 Codex 清理仅用于本次任务的临时中间产物，同时保留文档、备份和最终预览文件。
 
 这样可以减少 token 消耗、临时文件夹堆积，以及反复生成新 docx 的麻烦。
 
@@ -255,4 +259,3 @@ No license is currently granted. The repository is public for visibility and sha
 ## 许可证
 
 当前未授予开源许可证。仓库是公开可见的，但除非后续添加许可证文件，否则默认保留所有权利。
-
