@@ -1,0 +1,4 @@
+interface:
+  display_name: "Word Control"
+  short_description: "Control desktop Microsoft Word: read selection, replace text, add comments, track changes, save copies, and export PDFs."
+  default_prompt: "Use $word-control to work directly with the open Microsoft Word document. Prefer backups, selection-based edits, tracked changes, and comments for unresolved issues."
