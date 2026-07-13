@@ -1,188 +1,85 @@
 ---
 name: word-control
-description: Use when the user wants Codex to work directly with Microsoft Word desktop on Windows, especially to read the active Word document or selection, replace selected text, insert comments, enable tracked changes, save a copy, export PDF, or avoid creating a new DOCX from scratch. This skill uses local Word COM automation through Windows Script Host and should prefer safe selection-based edits with explicit backups for unpublished or important documents.
+description: Control the active Microsoft Word desktop document on Windows through local COM automation. Use for narrow in-place DOCX work such as reading the active document or selection, replacing selected text, adding comments or tracked changes, precisely editing table cells, rows, columns, borders, and shading, creating or editing Word equations, saving a protected copy, or exporting a PDF. Prefer this skill over generating a replacement DOCX when the user asks to edit an open Word file directly.
 ---
 
 # Word Control
 
-## Mission
+Work directly in desktop Microsoft Word while preserving the user's existing document and session.
 
-Control the local Microsoft Word desktop application directly when the user wants edits inside an open `.docx` instead of generating a new document file.
+## Core Workflow
 
-Use this skill for current-document workflows:
+1. Run `status` and confirm the active document name, full path, save state, read-only state, and protection state.
+2. For an important document, create a new versioned backup with `save-copy` before editing. If the document has unsaved changes and backup fails, do not silently save or use a stale disk copy; ask whether to save the source or proceed without a backup.
+3. Inspect the exact target immediately before mutation:
+   - Text or comments: run `selection-info` and retain `start`, `end`, and `text_hash`.
+   - Tables: run `tables` and retain the target table's `fingerprint`.
+   - Equations: run `equations` and retain the target equation's `fingerprint`.
+4. Put non-ASCII input in a task-local UTF-8 file. Use an isolated temporary folder, not the document's source folder unless necessary.
+5. Execute one narrow mutation with `--yes`, the expected document path or name, and the fresh selection or object fingerprint.
+6. Re-run the relevant read-only inspection. A table or equation fingerprint changes after a successful edit, so inspect again before another mutation.
+7. Save, close, or export only when the user requested it. Never quit the user's Word application.
+8. Remove task-only JSON, TXT, TSV, and probe artifacts. Preserve source documents, backups, and requested review outputs.
 
-- Read the active Word document or selected text.
-- Replace the current Word selection after revising text.
-- Enable or disable Track Changes.
-- Insert comments on the current selection.
-- Create, inspect, edit, or delete simple Word tables.
-- Normalize table borders when Word shows inconsistent black edges around merged cells.
-- Create, inspect, edit, or delete Word equation objects from Word linear syntax or common LaTeX syntax.
-- Save or close the active document when explicitly requested.
-- Save a copy before edits.
-- Export the active document to PDF for visual QA.
+## Non-Negotiable Guards
 
-## Safety Rules
+- Require `--expect-path` for saved documents. Use `--expect-name` only for an intentionally unsaved document.
+- Require all three selection values from one fresh `selection-info` result: `--expect-start`, `--expect-end`, and `--expect-selection-hash`.
+- Require `--expect-table-fingerprint` or `--expect-equation-fingerprint` from a fresh inspection before indexed object changes.
+- Treat `--allow-active`, `--allow-unverified-selection`, `--allow-unverified-target`, and `--allow-insert` as exceptional overrides. Use them only after manual target verification and only when their specific behavior is intended.
+- Refuse an existing backup, PDF, or smoke-test output unless the user explicitly approved replacement and `--overwrite` is passed.
+- Do not use `replace-paragraph`; it is disabled because Word paragraph ranges can duplicate or shift content. Select the exact range and use `replace-selection`.
+- Do not infer that a collapsed selection is intended. Insertion at the cursor requires explicit `--allow-insert`.
+- Do not close documents, dismiss dialogs, or alter Track Changes unless required by the user's request.
 
-- Before mutating a user document, make a backup with `save-copy` unless the user explicitly says not to.
-- Prefer editing the current selection, not whole-document replacement.
-- For manuscript editing, enable Track Changes before replacement unless the user asks for clean edits.
-- If the selection is empty, treat replacement as insertion at the cursor and say so.
-- Do not close Word or kill Word processes unless they were created by a smoke test and have no visible document title.
-- Do not use this for cloud-only Word Online documents unless they are open in desktop Word and COM can access them.
-- At task close, clean Word Control scratch artifacts created only for the task, such as probe/status `*.json`, temporary input/output `*.txt`, equation/table scratch files, and other transient files. Preserve source documents, edited documents, explicit backups, and final review artifacts such as PDF/PNG previews unless the user explicitly asks to remove them.
-
-## Script
-
-Main script:
+## Entry Point
 
 ```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" help
+$wc = "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js"
+cscript //nologo $wc help
 ```
 
-Use UTF-8 input and output files for non-ASCII text. Prefer `--output` over console output when reading Chinese text or long manuscript passages.
+Use `--output` for Chinese text or long output because the console code page can corrupt display text.
 
-## Common Commands
+## Operation Routing
 
-Status:
+- Read document state: `status`, `selection`, `selection-info`, `document-text`, `paragraphs`, `tables`, `equations`.
+- Edit prose: select the exact range, inspect it, then use `replace-selection`. Add `--track` for tracked manuscript edits.
+- Add an author query: select the exact non-empty range, inspect it, then use `insert-comment`.
+- Edit tables: inspect first, then use `set-cell`, `swap-cell-text`, row/column commands, targeted border/shading commands, `normalize-table-borders`, or `delete-table`. Reinspect after every operation because content and formatting both affect the fingerprint.
+- Edit equations: validate conversion with `convert-equation`, inspect existing equations when relevant, then use `insert-equation`, `set-equation`, or `delete-equation`.
+- Protect or review output: use `save-copy` with a new path or `export-pdf` with a new path.
+- Save or close: use `save-active` or `close-active` only when explicitly requested. `close-active` never terminates Word.
+
+For exact command forms, guard examples, and troubleshooting, read [references/usage.md](references/usage.md).
+
+## Equations
+
+The conservative LaTeX converter supports common fractions, square roots, integrals, sums, products, superscripts, subscripts, comparison symbols, and Greek letters. It rejects unknown LaTeX commands instead of inserting misleading plain text. Complex environments such as `align`, `matrix`, `cases`, and custom macros are unsupported; convert and inspect them manually before insertion.
+
+Word equation rendering must be verified by reopening or inspecting the resulting OMath object and, when layout matters, exporting a PDF for visual review.
+
+## Tables
+
+TSV dimensions must fit the requested table. Use `--allow-truncate` only when the user explicitly accepts dropped cells. Merged or irregular tables may not expose a rectangular row/column model; inspect their `linear_cells` and use `set-cell --cell`. Do not insert or delete whole rows or columns in an irregular table.
+
+Use `swap-cell-text` only to exchange textual contents while preserving each cell's formatting. Use explicit row/column insertion and deletion commands for structural changes; they reject deletion of the final row or column. Keep Track Changes off for deterministic structural changes unless the user explicitly approves `--allow-track-changes`.
+
+Use `set-cell-shading` for a solid RGB background. Use `set-cell-borders` for selected cell edges and `set-table-borders` for outer or internal table edges. Supported border styles are `none`, `single`, `dotted`, `dashed`, `dash-large`, `dash-dot`, `dash-dot-dot`, `double`, and `triple`; supported widths are the Word-native point values listed in the command guide. Formatting changes are included in the table fingerprint. `layout_warnings` document fallback behavior, while any `read_errors`, `failures`, or rollback failures mean the operation is incomplete and must not be reported as successful.
+
+## Verification
+
+Run the isolated test after changing this skill:
 
 ```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" status --output status.json
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\skills\word-control\scripts\test_word_control.ps1"
 ```
 
-Read current selection:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" selection --output selection.txt
-```
-
-Replace current selection using tracked changes:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" replace-selection --input revised.txt --track --yes
-```
-
-Insert a comment on the current selection:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" insert-comment --input comment.txt --yes
-```
-
-Inspect tables:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" tables --output tables.json
-```
-
-Create a table at the current selection or cursor:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" create-table --rows 3 --cols 3 --input table.tsv --yes
-```
-
-Edit a cell:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" set-cell --table 1 --row 2 --col 2 --input cell.txt --yes
-```
-
-Delete a table:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" delete-table --table 1 --yes
-```
-
-Normalize a table's borders to the light gray grid style:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" normalize-table-borders --table 1 --color D9DEE8 --line-width 4 --yes
-```
-
-Inspect equations:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" equations --output equations.json
-```
-
-Insert a LaTeX-like equation:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" insert-equation --input equation.txt --format latex --at end --yes
-```
-
-Edit an existing equation:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" set-equation --index 1 --input equation.txt --format latex --yes
-```
-
-Delete an equation:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" delete-equation --index 1 --yes
-```
-
-Save the active document:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" save-active --yes
-```
-
-Close the active document:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" close-active --save --quit-if-empty --yes
-```
-
-Save a copy:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" save-copy --path backup.docx --yes
-```
-
-Export PDF:
-
-```powershell
-cscript //nologo "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js" export-pdf --path preview.pdf --yes
-```
-
-## Editing Workflow
-
-1. Ask the user to open the target `.docx` in desktop Word and select the passage to edit.
-2. Run `status` and `selection`.
-3. Save a backup with `save-copy`.
-4. Use the relevant writing/editing skill to revise the selected text.
-5. Write revised text to a UTF-8 temporary file.
-6. Run `replace-selection --track --yes`.
-7. Insert comments for unresolved evidence, wording, statistics, citations, or author decisions.
-8. Export PDF if layout verification matters.
-9. Clean task-local scratch files created by Word Control (`status.json`, `selection.txt`, table/equation probe files, temporary revision text, and similar intermediate `*.json`/`*.txt` artifacts). Do not delete user documents, backups, or final verification previews.
-
-## Cleanup Standard
-
-Before final response, list the Word Control scratch artifacts created during the task and remove those that are purely intermediate. Keep anything needed for audit, rollback, or user review:
-
-- Keep original `.docx` files and edited final documents.
-- Keep explicit backups made with `save-copy`.
-- Keep final PDF/PNG previews when they document visual QA.
-- Remove temporary status, selection, table, paragraph, equation, and revision files unless the user asked to keep them.
-- If a file's role is ambiguous, keep it and mention it instead of deleting it silently.
-
-## Paragraph Replacement Caution
-
-Known local issue: `replace-paragraph --index n` may behave like an insertion-plus-blanking operation in some Word documents rather than a clean in-place replacement. It can leave the old paragraph later in the document, create extra blank paragraphs, and shift subsequent paragraph indexes. Do not use `replace-paragraph` to delete paragraphs by replacing them with a blank file.
-
-Safer rules:
-
-- Prefer `replace-selection` for targeted prose edits after selecting the exact range in Word.
-- If `replace-paragraph` is used, rerun `paragraphs` immediately after each mutation and verify with `document-text --full` before making another indexed edit.
-- For generated DOCX drafts, prefer regenerating a clean DOCX, then use Word Control for `open`, `save-copy`, `export-pdf`, and text/layout verification rather than chaining many indexed paragraph replacements.
-- Always check for duplicated old text after paragraph operations, especially when correcting a heading/body pair or after clearing an earlier paragraph.
+The test creates its own hidden Word instance and a unique temporary DOCX, then removes its artifacts. It must not attach to or close the user's Word session.
 
 ## Limitations
 
-- The current implementation uses Windows Script Host JScript because this machine's Python `pywin32` install path was not reliable at setup time.
-- It controls the desktop Word application on Windows; it is not a cross-platform Office.js add-in.
-- It does not yet provide a Word task-pane UI.
-- Whole-document rewrites are intentionally not the default because they are easier to damage.
-- Equation support uses Word's OMath engine. Raw LaTeX is translated through a conservative converter for common constructs such as `\frac{}`, `\sqrt{}`, `\int`, `\sum`, superscripts, subscripts, and Greek letters. Complex LaTeX environments such as `align`, `matrix`, or custom macros are not yet supported.
+- Windows desktop Word only; this is not a Word Online or cross-platform Office.js add-in.
+- Whole-document rewrites and complex layout reconstruction are outside the intended scope.
+- Comments and tracked changes can be created or toggled, but the script does not yet provide a full review-history report.
+- For new documents or structural DOCX generation, use the document-generation skill and use Word Control only for final in-place review or narrow corrections.

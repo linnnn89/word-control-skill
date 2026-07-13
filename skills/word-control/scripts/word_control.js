@@ -19,8 +19,12 @@ function hasFlag(flag) {
 
 function opt(name, fallbackValue) {
   for (var i = 1; i < ARGS.length - 1; i++) {
-    if (ARGS[i] === name) return ARGS[i + 1];
+    if (ARGS[i] === name) {
+      if (/^--/.test(ARGS[i + 1])) die("missing value for " + name);
+      return ARGS[i + 1];
+    }
   }
+  if (ARGS.length > 1 && ARGS[ARGS.length - 1] === name) die("missing value for " + name);
   return fallbackValue;
 }
 
@@ -33,9 +37,30 @@ function requireYes() {
   if (!hasFlag("--yes")) die("mutation command requires --yes");
 }
 
+function failJson(payload, code) {
+  emit(payload);
+  WScript.Quit(code || 1);
+}
+
 function absPath(path) {
   if (!path) return "";
   return fso.GetAbsolutePathName(path);
+}
+
+function canonicalPath(path) {
+  if (!path) return "";
+  return absPath(path).replace(/\//g, "\\").toLowerCase();
+}
+
+function prepareOutputPath(path, label) {
+  path = absPath(path);
+  if (!path) die(label + " requires an output path");
+  var parent = fso.GetParentFolderName(path);
+  if (parent && !fso.FolderExists(parent)) die("output folder not found: " + parent);
+  if (fso.FileExists(path) && !hasFlag("--overwrite")) {
+    die("refusing to overwrite existing output; choose a new path or pass --overwrite: " + path);
+  }
+  return path;
 }
 
 function readUtf8(path) {
@@ -85,15 +110,40 @@ function q(value) {
   return "\"" + jescape(value) + "\"";
 }
 
+function stringArrayJson(values) {
+  var out = [];
+  for (var i = 0; i < values.length; i++) out.push(q(values[i]));
+  return "[" + out.join(",") + "]";
+}
+
 function normalizeText(value) {
   if (value === null || typeof value === "undefined") return "";
   return String(value).replace(/\r/g, "\n");
 }
 
+function boolJson(value) {
+  return value ? "true" : "false";
+}
+
+function textHash(value) {
+  var text = normalizeText(value);
+  var hash = 5381;
+  for (var i = 0; i < text.length; i++) {
+    hash = (((hash << 5) + hash) ^ text.charCodeAt(i)) >>> 0;
+  }
+  var hex = hash.toString(16);
+  while (hex.length < 8) hex = "0" + hex;
+  return hex;
+}
+
+function parseNonNegativeInt(value, name) {
+  if (!/^\d+$/.test(String(value || ""))) die(name + " must be a non-negative integer");
+  return parseInt(value, 10);
+}
+
 function parsePositiveInt(value, name) {
-  var n = parseInt(value, 10);
-  if (!n || n < 1) die(name + " must be a positive integer");
-  return n;
+  if (!/^[1-9]\d*$/.test(String(value || ""))) die(name + " must be a positive integer");
+  return parseInt(value, 10);
 }
 
 function parseHexColor(value) {
@@ -105,16 +155,78 @@ function parseHexColor(value) {
   return r + (g * 256) + (b * 65536);
 }
 
-function setComBorder(border, color, lineWidth) {
-  border.LineStyle = 1; // wdLineStyleSingle
-  border.LineWidth = lineWidth;
-  border.Color = color;
+function parseBorderStyle(value) {
+  var styles = {
+    "none": 0,
+    "single": 1,
+    "dotted": 2,
+    "dashed": 3,
+    "dash-large": 4,
+    "dash-dot": 5,
+    "dash-dot-dot": 6,
+    "double": 7,
+    "triple": 8
+  };
+  value = String(value || "").toLowerCase();
+  if (typeof styles[value] === "undefined") {
+    die("border style must be none, single, dotted, dashed, dash-large, dash-dot, dash-dot-dot, double, or triple");
+  }
+  return styles[value];
 }
 
-function setBorderCollection(borders, borderTypes, color, lineWidth) {
-  for (var i = 0; i < borderTypes.length; i++) {
-    try { setComBorder(borders(borderTypes[i]), color, lineWidth); } catch (e) {}
+function parseBorderWidth(value) {
+  var widths = {
+    "0.25": 2,
+    "0.5": 4,
+    "0.50": 4,
+    "0.75": 6,
+    "1": 8,
+    "1.0": 8,
+    "1.00": 8,
+    "1.5": 12,
+    "1.50": 12,
+    "2.25": 18,
+    "3": 24,
+    "3.0": 24,
+    "3.00": 24,
+    "4.5": 36,
+    "4.50": 36,
+    "6": 48,
+    "6.0": 48,
+    "6.00": 48
+  };
+  value = String(value || "");
+  if (typeof widths[value] === "undefined") {
+    die("border width must be 0.25, 0.5, 0.75, 1, 1.5, 2.25, 3, 4.5, or 6 points");
   }
+  return widths[value];
+}
+
+function setComBorder(border, color, lineWidth, lineStyle) {
+  if (typeof lineStyle === "undefined") lineStyle = 1; // wdLineStyleSingle
+  border.LineStyle = lineStyle;
+  if (lineStyle !== 0) {
+    border.LineWidth = lineWidth;
+    border.Color = color;
+  }
+  if (Number(border.LineStyle) !== Number(lineStyle)) {
+    throw new Error("border readback did not match requested style");
+  }
+  if (lineStyle !== 0 && (Number(border.LineWidth) !== Number(lineWidth) || Number(border.Color) !== Number(color))) {
+    throw new Error("border readback did not match requested width or color");
+  }
+}
+
+function setBorderCollection(borders, borderTypes, color, lineWidth, prefix, lineStyle) {
+  var failures = [];
+  for (var i = 0; i < borderTypes.length; i++) {
+    try {
+      setComBorder(borders(borderTypes[i]), color, lineWidth, lineStyle);
+    } catch (e) {
+      failures.push((prefix || "border") + ":" + borderTypes[i] + ":" + (e.message || String(e)));
+    }
+  }
+  return failures;
 }
 
 function cleanCellText(value) {
@@ -127,16 +239,196 @@ function setCellText(cell, text) {
   range.Text = text;
 }
 
-function fillTableFromTsv(table, text) {
-  var rows = text.replace(/\r/g, "").split("\n");
+function getRegularTableDimensions(table, operation) {
+  var rows;
+  var cols;
+  try { rows = Number(table.Rows.Count); } catch (e1) { die(operation + " requires a regular table without vertically merged cells: " + e1.message); }
+  try { cols = Number(table.Columns.Count); } catch (e2) { die(operation + " requires a regular table without horizontally merged cells: " + e2.message); }
+  return { rows: rows, cols: cols };
+}
+
+function resolveTableCell(table, cellOption, rowOption, colOption, label) {
+  var cellText = opt(cellOption, "");
+  var rowText = opt(rowOption, "");
+  var colText = opt(colOption, "");
+  if (cellText && (rowText || colText)) die(label + " must use either " + cellOption + " or " + rowOption + " with " + colOption);
+  if (!cellText && (!rowText || !colText)) die(label + " requires " + cellOption + " or both " + rowOption + " and " + colOption);
+  if (cellText) {
+    var cellIndex = parsePositiveInt(cellText, cellOption);
+    var linearCount = Number(table.Range.Cells.Count);
+    if (cellIndex > linearCount) die(label + " cell index out of range; table has " + linearCount + " linear cells");
+    return { cell: table.Range.Cells(cellIndex), cellIndex: cellIndex, row: 0, col: 0 };
+  }
+  var dimensions = getRegularTableDimensions(table, label);
+  var row = parsePositiveInt(rowText, rowOption);
+  var col = parsePositiveInt(colText, colOption);
+  if (row > dimensions.rows) die(label + " row index out of range; table has " + dimensions.rows + " rows");
+  if (col > dimensions.cols) die(label + " column index out of range; table has " + dimensions.cols + " columns");
+  return { cell: table.Cell(row, col), cellIndex: 0, row: row, col: col };
+}
+
+function cellTargetJson(target) {
+  return "{\"cell\":" + (target.cellIndex || "null") + ",\"row\":" + (target.row || "null") + ",\"col\":" + (target.col || "null") + "}";
+}
+
+function borderSignature(borders, borderTypes) {
+  var parts = [];
+  for (var i = 0; i < borderTypes.length; i++) {
+    try {
+      var border = borders(borderTypes[i]);
+      parts.push(borderTypes[i] + ":" + Number(border.LineStyle) + ":" + Number(border.LineWidth) + ":" + Number(border.Color));
+    } catch (e) {
+      parts.push(borderTypes[i] + ":?");
+    }
+  }
+  return parts.join(",");
+}
+
+function parseBorderEdges(value, scope) {
+  var tableMap = { "top": -1, "left": -2, "bottom": -3, "right": -4, "inside-h": -5, "inside-v": -6 };
+  var cellMap = { "top": -1, "left": -2, "bottom": -3, "right": -4 };
+  var map = scope === "table" ? tableMap : cellMap;
+  var raw = String(value || "").toLowerCase().replace(/\s+/g, "").split(",");
+  var expanded = [];
+  for (var i = 0; i < raw.length; i++) {
+    if (!raw[i]) continue;
+    if (raw[i] === "all") {
+      expanded = scope === "table" ? ["top", "left", "bottom", "right", "inside-h", "inside-v"] : ["top", "left", "bottom", "right"];
+      break;
+    }
+    if (raw[i] === "outer") {
+      expanded.push("top", "left", "bottom", "right");
+    } else {
+      expanded.push(raw[i]);
+    }
+  }
+  if (!expanded.length) die("--edges must name at least one border edge");
+  var names = [];
+  var types = [];
+  var seen = {};
+  for (var j = 0; j < expanded.length; j++) {
+    var name = expanded[j];
+    if (typeof map[name] === "undefined") {
+      die(scope + " border edge is invalid: " + name);
+    }
+    if (!seen[name]) {
+      seen[name] = true;
+      names.push(name);
+      types.push(map[name]);
+    }
+  }
+  return { names: names, types: types };
+}
+
+function applyBordersAtomically(borders, borderTypes, color, lineWidth, lineStyle) {
+  var snapshots = [];
+  var failures = [];
+  var rollbackFailures = [];
+  for (var i = 0; i < borderTypes.length; i++) {
+    try {
+      var border = borders(borderTypes[i]);
+      snapshots.push({
+        type: borderTypes[i],
+        lineStyle: Number(border.LineStyle),
+        lineWidth: Number(border.LineWidth),
+        color: Number(border.Color)
+      });
+    } catch (e1) {
+      failures.push("capture:" + borderTypes[i] + ":" + (e1.message || String(e1)));
+      return { failures: failures, rollbackFailures: rollbackFailures, rolledBack: true };
+    }
+  }
+  for (var j = 0; j < borderTypes.length; j++) {
+    try {
+      setComBorder(borders(borderTypes[j]), color, lineWidth, lineStyle);
+    } catch (e2) {
+      failures.push("apply:" + borderTypes[j] + ":" + (e2.message || String(e2)));
+      break;
+    }
+  }
+  if (failures.length) {
+    for (var k = 0; k < snapshots.length; k++) {
+      try {
+        var restore = borders(snapshots[k].type);
+        restore.LineStyle = snapshots[k].lineStyle;
+        if (snapshots[k].lineStyle !== 0) {
+          restore.LineWidth = snapshots[k].lineWidth;
+          restore.Color = snapshots[k].color;
+        }
+      } catch (e3) {
+        rollbackFailures.push("restore:" + snapshots[k].type + ":" + (e3.message || String(e3)));
+      }
+    }
+  }
+  return {
+    failures: failures,
+    rollbackFailures: rollbackFailures,
+    rolledBack: failures.length > 0 && rollbackFailures.length === 0
+  };
+}
+
+function parseTsv(text) {
+  var rows = String(text || "").replace(/\r/g, "").split("\n");
+  if (rows.length && rows[rows.length - 1] === "") rows.pop();
+  var parsed = [];
+  var maxCols = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var cells = rows[i].split("\t");
+    if (cells.length > maxCols) maxCols = cells.length;
+    parsed.push(cells);
+  }
+  return { rows: parsed, rowCount: parsed.length, maxCols: maxCols };
+}
+
+function fillTableFromTsv(table, parsed) {
   var rowCount = Number(table.Rows.Count);
   var colCount = Number(table.Columns.Count);
-  for (var r = 0; r < rows.length && r < rowCount; r++) {
-    if (rows[r] === "" && r === rows.length - 1) continue;
-    var cells = rows[r].split("\t");
+  for (var r = 0; r < parsed.rows.length && r < rowCount; r++) {
+    var cells = parsed.rows[r];
     for (var c = 0; c < cells.length && c < colCount; c++) {
       setCellText(table.Cell(r + 1, c + 1), cells[c]);
     }
+  }
+}
+
+function tableFingerprint(table) {
+  var rows = "?";
+  var cols = "?";
+  var text = "";
+  var formatting = [];
+  try { rows = String(table.Rows.Count); } catch (e1) {}
+  try { cols = String(table.Columns.Count); } catch (e2) {}
+  try { text = cleanCellText(table.Range.Text); } catch (e3) {}
+  try { formatting.push("tb:" + borderSignature(table.Borders, [-1, -2, -3, -4, -5, -6])); } catch (e4) { formatting.push("tb:?"); }
+  try {
+    var cellCount = Number(table.Range.Cells.Count);
+    for (var i = 1; i <= cellCount; i++) {
+      var cell = table.Range.Cells(i);
+      var shading = "?";
+      var texture = "?";
+      try { shading = String(Number(cell.Shading.BackgroundPatternColor)); } catch (e5) {}
+      try { texture = String(Number(cell.Shading.Texture)); } catch (e6) {}
+      formatting.push("c" + i + ":" + shading + ":" + texture + ":" + borderSignature(cell.Borders, [-1, -2, -3, -4]));
+    }
+  } catch (e7) {
+    formatting.push("cells:?");
+  }
+  return textHash(rows + "x" + cols + "|" + text + "|" + formatting.join("|"));
+}
+
+function equationFingerprint(equation) {
+  var text = "";
+  try { text = normalizeText(equation.Range.Text); } catch (e) {}
+  return textHash(text);
+}
+
+function requireFingerprint(actual, optionName, unsafeFlag) {
+  var expected = opt(optionName, "");
+  if (!expected && !hasFlag(unsafeFlag)) {
+    die("target mutation requires " + optionName + " from a fresh inspection; use " + unsafeFlag + " only after manual verification");
+  }
+  if (expected && String(expected).toLowerCase() !== String(actual).toLowerCase()) {
+    die("target fingerprint changed; inspect the document again before mutating");
   }
 }
 
@@ -253,7 +545,14 @@ function equationInputText() {
   var input = opt("--input", "");
   var text = readUtf8(input);
   var format = opt("--format", "latex");
-  if (format === "latex") return convertLatexToWordLinear(text);
+  if (format === "latex") {
+    var converted = convertLatexToWordLinear(text);
+    var unknown = converted.match(/\\[A-Za-z]+/g);
+    if (unknown && unknown.length) {
+      die("unsupported LaTeX command(s): " + unknown.join(", ") + "; use --format linear only after verifying Word linear syntax");
+    }
+    return converted;
+  }
   if (format === "linear" || format === "word") return text.replace(/\r/g, "").replace(/\n/g, " ");
   die("--format must be latex, linear, or word");
 }
@@ -288,17 +587,92 @@ function safeDocPath(doc) {
   }
 }
 
+function requireExpectedDocument(doc) {
+  var expectedPath = opt("--expect-path", "");
+  var expectedName = opt("--expect-name", "");
+  if (!expectedPath && !expectedName && !hasFlag("--allow-active")) {
+    die("mutation requires --expect-path or --expect-name; use --allow-active only after manually verifying the active document");
+  }
+  if (expectedPath) {
+    var actualPath = safeDocPath(doc);
+    if (!actualPath || canonicalPath(actualPath) !== canonicalPath(expectedPath)) {
+      die("active document path mismatch; expected " + absPath(expectedPath) + ", got " + (actualPath || "[unsaved document]"));
+    }
+  }
+  if (expectedName && String(doc.Name).toLowerCase() !== String(expectedName).toLowerCase()) {
+    die("active document name mismatch; expected " + expectedName + ", got " + String(doc.Name));
+  }
+}
+
+function getMutationDocument(word) {
+  var doc = getActiveDocument(word);
+  requireExpectedDocument(doc);
+  return doc;
+}
+
+function selectionSnapshot(word) {
+  var range = word.Selection.Range;
+  var text = normalizeText(range.Text);
+  return {
+    range: range,
+    start: Number(range.Start),
+    end: Number(range.End),
+    collapsed: Number(range.Start) === Number(range.End),
+    text: text,
+    hash: textHash(text)
+  };
+}
+
+function selectionSnapshotJson(snapshot) {
+  return "{"
+    + "\"start\":" + snapshot.start + ","
+    + "\"end\":" + snapshot.end + ","
+    + "\"collapsed\":" + boolJson(snapshot.collapsed) + ","
+    + "\"text_length\":" + snapshot.text.length + ","
+    + "\"text_hash\":" + q(snapshot.hash)
+    + "}";
+}
+
+function requireExpectedSelection(word, allowCollapsed) {
+  var snapshot = selectionSnapshot(word);
+  if (snapshot.collapsed && !allowCollapsed && !hasFlag("--allow-insert")) {
+    die("selection is collapsed; pass --allow-insert only when insertion at the cursor is intended");
+  }
+  var expectedStart = opt("--expect-start", "");
+  var expectedEnd = opt("--expect-end", "");
+  var expectedHash = opt("--expect-selection-hash", "");
+  if ((!expectedStart || !expectedEnd || !expectedHash) && !hasFlag("--allow-unverified-selection")) {
+    die("selection mutation requires --expect-start, --expect-end, and --expect-selection-hash from selection-info");
+  }
+  if (expectedStart && parseNonNegativeInt(expectedStart, "--expect-start") !== snapshot.start) {
+    die("selection start changed; rerun selection-info before mutating");
+  }
+  if (expectedEnd && parseNonNegativeInt(expectedEnd, "--expect-end") !== snapshot.end) {
+    die("selection end changed; rerun selection-info before mutating");
+  }
+  if (expectedHash && String(expectedHash).toLowerCase() !== snapshot.hash) {
+    die("selection text changed; rerun selection-info before mutating");
+  }
+  return snapshot;
+}
+
 function activeDocJson(word, doc) {
   var path = safeDocPath(doc);
   var saved = "";
   var track = "";
+  var readOnly = "";
+  var protectionType = "";
   try { saved = String(doc.Saved); } catch (e1) {}
   try { track = String(doc.TrackRevisions); } catch (e2) {}
+  try { readOnly = String(doc.ReadOnly); } catch (e3) {}
+  try { protectionType = String(doc.ProtectionType); } catch (e4) {}
   return "{"
     + "\"name\":" + q(doc.Name) + ","
     + "\"path\":" + q(path) + ","
     + "\"saved\":" + q(saved) + ","
-    + "\"track_revisions\":" + q(track)
+    + "\"track_revisions\":" + q(track) + ","
+    + "\"read_only\":" + q(readOnly) + ","
+    + "\"protection_type\":" + q(protectionType)
     + "}";
 }
 
@@ -307,28 +681,40 @@ function commandHelp() {
     "word-control commands:",
     "  status [--output file]",
     "  selection [--output file]",
+    "  selection-info [--output file]",
     "  document-text [--max chars|--full] [--output file]",
     "  paragraphs [--max count] [--output file]",
-    "  tables [--output file]",
+    "  tables [--max count] [--output file]",
     "  equations [--output file]",
-    "  enable-track-changes --yes",
-    "  disable-track-changes --yes",
-    "  replace-selection --input file [--track] --yes",
-    "  replace-paragraph --index n --input file [--track] --yes",
-    "  insert-comment --input file --yes",
-    "  create-table --rows n --cols n [--input table.tsv] [--at selection|end] --yes",
-    "  set-cell --table n --row n --col n --input file --yes",
-    "  delete-table --table n --yes",
-    "  normalize-table-borders --table n [--color D9DEE8] [--line-width 4] --yes",
-    "  insert-equation --input file [--format latex|linear] [--at selection|end] --yes",
-    "  set-equation --index n --input file [--format latex|linear] --yes",
-    "  delete-equation --index n --yes",
-    "  save-active --yes",
-    "  close-active --save|--discard [--quit-if-empty] --yes",
-    "  save-copy --path file --yes",
-    "  export-pdf --path file --yes",
+    "  convert-equation --input file [--format latex|linear|word] [--output file]",
+    "  enable-track-changes --expect-path file --yes",
+    "  disable-track-changes --expect-path file --yes",
+    "  replace-selection --input file --expect-path file --expect-start n --expect-end n --expect-selection-hash hash [--track] [--allow-insert] --yes",
+    "  insert-comment --input file --expect-path file --expect-start n --expect-end n --expect-selection-hash hash --yes",
+    "  create-table --rows n --cols n [--input table.tsv] [--at selection|end] --expect-path file [selection guards when --at selection] --yes",
+    "  set-cell --table n --expect-table-fingerprint hash (--cell n | --row n --col n) --input file --expect-path file --yes",
+    "  swap-cell-text --table n --expect-table-fingerprint hash (--from-cell n | --from-row n --from-col n) (--to-cell n | --to-row n --to-col n) --expect-path file --yes",
+    "  insert-row --table n --expect-table-fingerprint hash (--before n | --at-end) --expect-path file --yes",
+    "  delete-row --table n --expect-table-fingerprint hash --row n --expect-path file --yes",
+    "  insert-column --table n --expect-table-fingerprint hash (--before n | --at-end) --expect-path file --yes",
+    "  delete-column --table n --expect-table-fingerprint hash --col n --expect-path file --yes",
+    "  set-cell-shading --table n --expect-table-fingerprint hash (--cell n | --row n --col n) --color RRGGBB --expect-path file --yes",
+    "  set-cell-borders --table n --expect-table-fingerprint hash [cell target] --edges top,bottom --style single [--color RRGGBB] [--width 0.5] --expect-path file --yes",
+    "  set-table-borders --table n --expect-table-fingerprint hash --edges outer,inside-h,inside-v --style single [--color RRGGBB] [--width 0.5] --expect-path file --yes",
+    "  delete-table --table n --expect-table-fingerprint hash --expect-path file --yes",
+    "  normalize-table-borders --table n --expect-table-fingerprint hash [--color D9DEE8] [--line-width 4] --expect-path file --yes",
+    "  insert-equation --input file [--format latex|linear|word] [--at selection|end] --expect-path file [selection guards when --at selection] --yes",
+    "  set-equation --index n --expect-equation-fingerprint hash --input file [--format latex|linear|word] --expect-path file --yes",
+    "  delete-equation --index n --expect-equation-fingerprint hash --expect-path file --yes",
+    "  save-active --expect-path file --yes",
+    "  close-active --save|--discard --expect-path file --yes",
+    "  save-copy --path file --expect-path file [--overwrite] --yes",
+    "  export-pdf --path file --expect-path file [--overwrite] --yes",
     "  open --path file",
-    "  smoke --path file"
+    "  smoke --path new-file.docx [--overwrite] --yes",
+    "",
+    "Mutation guards: use --expect-name for unsaved documents; --allow-active, --allow-unverified-selection, and --allow-unverified-target are explicit unsafe overrides.",
+    "replace-paragraph is disabled; select the exact paragraph and use replace-selection."
   ].join("\n"));
 }
 
@@ -338,13 +724,18 @@ function commandStatus() {
   var selectionText = "";
   try { selectionText = String(word.Selection.Text); } catch (e1) {}
   var docPart = "null";
+  var selectionPart = "null";
   if (docs > 0) docPart = activeDocJson(word, word.ActiveDocument);
+  if (docs > 0) {
+    try { selectionPart = selectionSnapshotJson(selectionSnapshot(word)); } catch (e2) {}
+  }
   emit("{"
     + "\"ok\":true,"
     + "\"word_version\":" + q(word.Version) + ","
     + "\"documents_count\":" + docs + ","
     + "\"active_document\":" + docPart + ","
-    + "\"selection_text_length\":" + normalizeText(selectionText).length
+    + "\"selection_text_length\":" + normalizeText(selectionText).length + ","
+    + "\"selection\":" + selectionPart
     + "}");
 }
 
@@ -356,13 +747,26 @@ function commandSelection() {
   emit(text);
 }
 
+function commandSelectionInfo() {
+  var word = getWord();
+  var doc = getActiveDocument(word);
+  var snapshot = selectionSnapshot(word);
+  emit("{\"ok\":true,\"document\":" + activeDocJson(word, doc) + ",\"selection\":" + selectionSnapshotJson(snapshot) + "}");
+}
+
+function commandConvertEquation() {
+  var linearText = equationInputText();
+  if (!linearText) die("equation input is empty after conversion");
+  emit("{\"ok\":true,\"linear\":" + q(linearText) + "}");
+}
+
 function commandDocumentText() {
   var word = getWord();
   var doc = getActiveDocument(word);
   var text = normalizeText(doc.Content.Text);
   if (!hasFlag("--full")) {
-    var max = parseInt(opt("--max", "20000"), 10);
-    if (max > 0 && text.length > max) text = text.substring(0, max) + "\n[truncated at " + max + " chars]";
+    var max = parsePositiveInt(opt("--max", "20000"), "--max");
+    if (text.length > max) text = text.substring(0, max) + "\n[truncated at " + max + " chars]";
   }
   emit(text);
 }
@@ -370,9 +774,9 @@ function commandDocumentText() {
 function commandParagraphs() {
   var word = getWord();
   var doc = getActiveDocument(word);
-  var max = parseInt(opt("--max", "80"), 10);
+  var max = parsePositiveInt(opt("--max", "80"), "--max");
   var count = Number(doc.Paragraphs.Count);
-  if (max < 1 || max > count) max = count;
+  if (max > count) max = count;
   var parts = [];
   for (var i = 1; i <= max; i++) {
     var text = "";
@@ -386,24 +790,74 @@ function commandTables() {
   var word = getWord();
   var doc = getActiveDocument(word);
   var count = Number(doc.Tables.Count);
+  var maxText = opt("--max", "");
+  var returned = maxText ? parsePositiveInt(maxText, "--max") : count;
+  if (returned > count) returned = count;
   var parts = [];
-  for (var i = 1; i <= count; i++) {
+  for (var i = 1; i <= returned; i++) {
     var table = doc.Tables(i);
-    var rowCount = Number(table.Rows.Count);
-    var colCount = Number(table.Columns.Count);
+    var rowCount = 0;
+    var colCount = 0;
+    var rowCountKnown = true;
+    var colCountKnown = true;
+    var layoutWarnings = [];
+    var readErrors = [];
+    try { rowCount = Number(table.Rows.Count); } catch (e1) { rowCountKnown = false; layoutWarnings.push("rows:" + (e1.message || String(e1))); }
+    try { colCount = Number(table.Columns.Count); } catch (e2) { colCountKnown = false; layoutWarnings.push("columns:" + (e2.message || String(e2))); }
     var cells = [];
-    for (var r = 1; r <= rowCount; r++) {
-      var rowCells = [];
-      for (var c = 1; c <= colCount; c++) {
-        var text = "";
-        try { text = cleanCellText(table.Cell(r, c).Range.Text); } catch (e) {}
-        rowCells.push(q(text));
+    var linearCells = [];
+    var cellCount = 0;
+    var rectangular = rowCountKnown && colCountKnown && rowCount > 0 && colCount > 0;
+    var rectangleFailed = false;
+    if (rectangular) {
+      for (var r = 1; r <= rowCount && !rectangleFailed; r++) {
+        var rowCells = [];
+        for (var c = 1; c <= colCount; c++) {
+          try {
+            rowCells.push(q(cleanCellText(table.Cell(r, c).Range.Text)));
+          } catch (e3) {
+            layoutWarnings.push("cell[" + r + "," + c + "]:" + (e3.message || String(e3)));
+            rectangleFailed = true;
+            break;
+          }
+        }
+        if (!rectangleFailed) cells.push("[" + rowCells.join(",") + "]");
       }
-      cells.push("[" + rowCells.join(",") + "]");
+      if (rectangleFailed) {
+        rectangular = false;
+        cells = [];
+      }
     }
-    parts.push("{\"index\":" + i + ",\"rows\":" + rowCount + ",\"cols\":" + colCount + ",\"cells\":[" + cells.join(",") + "]}");
+    if (rectangular) {
+      cellCount = rowCount * colCount;
+    } else {
+      try {
+        cellCount = Number(table.Range.Cells.Count);
+        for (var k = 1; k <= cellCount; k++) {
+          var cell = table.Range.Cells(k);
+          var rowJson = "null";
+          var colJson = "null";
+          var textJson = "null";
+          try { rowJson = String(Number(cell.RowIndex)); } catch (e4) { layoutWarnings.push("linear-cell[" + k + "]-row:" + (e4.message || String(e4))); }
+          try { colJson = String(Number(cell.ColumnIndex)); } catch (e5) { layoutWarnings.push("linear-cell[" + k + "]-column:" + (e5.message || String(e5))); }
+          try { textJson = q(cleanCellText(cell.Range.Text)); } catch (e6) { readErrors.push("linear-cell[" + k + "]-text:" + (e6.message || String(e6))); }
+          linearCells.push("{\"index\":" + k + ",\"row\":" + rowJson + ",\"col\":" + colJson + ",\"text\":" + textJson + "}");
+        }
+      } catch (e7) {
+        readErrors.push("linear-cell-enumeration:" + (e7.message || String(e7)));
+      }
+    }
+    parts.push("{\"index\":" + i + ",\"rows\":" + (rowCountKnown ? rowCount : "null") + ",\"cols\":" + (colCountKnown ? colCount : "null")
+      + ",\"layout\":" + q(rectangular ? "rectangular" : "irregular")
+      + ",\"cell_count\":" + cellCount
+      + ",\"fingerprint\":" + q(tableFingerprint(table))
+      + ",\"inspection_complete\":" + boolJson(readErrors.length === 0)
+      + ",\"layout_warnings\":" + stringArrayJson(layoutWarnings)
+      + ",\"read_errors\":" + stringArrayJson(readErrors)
+      + ",\"cells\":[" + cells.join(",") + "]"
+      + ",\"linear_cells\":[" + linearCells.join(",") + "]}");
   }
-  emit("{\"ok\":true,\"table_count\":" + count + ",\"tables\":[" + parts.join(",") + "]}");
+  emit("{\"ok\":true,\"table_count\":" + count + ",\"returned\":" + returned + ",\"tables\":[" + parts.join(",") + "]}");
 }
 
 function commandEquations() {
@@ -414,7 +868,8 @@ function commandEquations() {
   for (var i = 1; i <= count; i++) {
     var text = "";
     try { text = normalizeText(doc.OMaths(i).Range.Text); } catch (e) {}
-    parts.push("{\"index\":" + i + ",\"text\":" + q(text) + "}");
+    parts.push("{\"index\":" + i + ",\"text\":" + q(text)
+      + ",\"fingerprint\":" + q(equationFingerprint(doc.OMaths(i))) + "}");
   }
   emit("{\"ok\":true,\"equation_count\":" + count + ",\"equations\":[" + parts.join(",") + "]}");
 }
@@ -422,7 +877,7 @@ function commandEquations() {
 function commandTrack(on) {
   requireYes();
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   doc.TrackRevisions = on;
   emit("{\"ok\":true,\"track_revisions\":" + q(String(doc.TrackRevisions)) + "}");
 }
@@ -432,34 +887,21 @@ function commandReplaceSelection() {
   var input = opt("--input", "");
   var text = readUtf8(input);
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
+  var selection = requireExpectedSelection(word, false);
   if (hasFlag("--track")) doc.TrackRevisions = true;
   try {
-    word.Selection.Range.Text = text;
+    selection.range.Text = text;
   } catch (e) {
     die("failed to replace selection: " + e.message);
   }
-  emit("{\"ok\":true,\"action\":\"replace-selection\",\"chars\":" + text.length + ",\"track_revisions\":" + q(String(doc.TrackRevisions)) + "}");
+  emit("{\"ok\":true,\"action\":\"replace-selection\",\"chars\":" + text.length
+    + ",\"selection_before\":" + selectionSnapshotJson(selection)
+    + ",\"track_revisions\":" + q(String(doc.TrackRevisions)) + "}");
 }
 
 function commandReplaceParagraph() {
-  requireYes();
-  var idx = parseInt(opt("--index", "0"), 10);
-  if (!idx || idx < 1) die("replace-paragraph requires --index n");
-  var input = opt("--input", "");
-  var text = readUtf8(input);
-  var word = getWord();
-  var doc = getActiveDocument(word);
-  var count = Number(doc.Paragraphs.Count);
-  if (idx > count) die("paragraph index out of range; document has " + count + " paragraphs");
-  if (hasFlag("--track")) doc.TrackRevisions = true;
-  if (!/\r$/.test(text)) text = text + "\r";
-  try {
-    doc.Paragraphs(idx).Range.Text = text;
-  } catch (e) {
-    die("failed to replace paragraph: " + e.message);
-  }
-  emit("{\"ok\":true,\"action\":\"replace-paragraph\",\"index\":" + idx + ",\"chars\":" + text.length + ",\"track_revisions\":" + q(String(doc.TrackRevisions)) + "}");
+  die("replace-paragraph is disabled because Word paragraph ranges can duplicate or shift content; select the exact paragraph and use replace-selection");
 }
 
 function commandInsertComment() {
@@ -467,13 +909,15 @@ function commandInsertComment() {
   var input = opt("--input", "");
   var text = readUtf8(input);
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
+  var selection = requireExpectedSelection(word, false);
   try {
-    doc.Comments.Add(word.Selection.Range, text);
+    doc.Comments.Add(selection.range, text);
   } catch (e) {
     die("failed to insert comment: " + e.message);
   }
-  emit("{\"ok\":true,\"action\":\"insert-comment\",\"chars\":" + text.length + "}");
+  emit("{\"ok\":true,\"action\":\"insert-comment\",\"chars\":" + text.length
+    + ",\"selection_before\":" + selectionSnapshotJson(selection) + "}");
 }
 
 function commandCreateTable() {
@@ -481,14 +925,24 @@ function commandCreateTable() {
   var rows = parsePositiveInt(opt("--rows", "0"), "--rows");
   var cols = parsePositiveInt(opt("--cols", "0"), "--cols");
   var at = opt("--at", "selection");
+  if (at !== "selection" && at !== "end") die("--at must be selection or end");
   var input = opt("--input", "");
+  var parsed = null;
+  var truncated = false;
+  if (input) {
+    parsed = parseTsv(readUtf8(input));
+    truncated = parsed.rowCount > rows || parsed.maxCols > cols;
+    if (truncated && !hasFlag("--allow-truncate")) {
+      die("TSV dimensions " + parsed.rowCount + "x" + parsed.maxCols + " exceed target table " + rows + "x" + cols + "; resize the table or pass --allow-truncate explicitly");
+    }
+  }
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   var range;
   if (at === "end") {
     range = doc.Range(doc.Content.End - 1, doc.Content.End - 1);
   } else {
-    range = word.Selection.Range;
+    range = requireExpectedSelection(word, true).range;
   }
   var table;
   try {
@@ -496,41 +950,274 @@ function commandCreateTable() {
   } catch (e) {
     die("failed to create table: " + e.message);
   }
-  if (input) fillTableFromTsv(table, readUtf8(input));
-  emit("{\"ok\":true,\"action\":\"create-table\",\"table_count\":" + Number(doc.Tables.Count) + ",\"rows\":" + rows + ",\"cols\":" + cols + "}");
+  if (parsed) fillTableFromTsv(table, parsed);
+  emit("{\"ok\":true,\"action\":\"create-table\",\"table_count\":" + Number(doc.Tables.Count)
+    + ",\"rows\":" + rows + ",\"cols\":" + cols + ",\"truncated\":" + boolJson(truncated)
+    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
 }
 
 function commandSetCell() {
   requireYes();
   var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
-  var row = parsePositiveInt(opt("--row", "0"), "--row");
-  var col = parsePositiveInt(opt("--col", "0"), "--col");
+  var cellText = opt("--cell", "");
+  var rowText = opt("--row", "");
+  var colText = opt("--col", "");
+  if (cellText && (rowText || colText)) die("use either --cell or --row with --col, not both");
+  if (!cellText && (!rowText || !colText)) die("set-cell requires --cell or both --row and --col");
+  var cellIndex = cellText ? parsePositiveInt(cellText, "--cell") : 0;
+  var row = rowText ? parsePositiveInt(rowText, "--row") : 0;
+  var col = colText ? parsePositiveInt(colText, "--col") : 0;
   var input = opt("--input", "");
   var text = readUtf8(input);
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   var tableCount = Number(doc.Tables.Count);
   if (tableIndex > tableCount) die("table index out of range; document has " + tableCount + " tables");
   var table = doc.Tables(tableIndex);
-  if (row > Number(table.Rows.Count)) die("row index out of range; table has " + Number(table.Rows.Count) + " rows");
-  if (col > Number(table.Columns.Count)) die("column index out of range; table has " + Number(table.Columns.Count) + " columns");
-  try {
-    setCellText(table.Cell(row, col), text);
-  } catch (e) {
-    die("failed to set cell: " + e.message);
+  requireFingerprint(tableFingerprint(table), "--expect-table-fingerprint", "--allow-unverified-target");
+  var targetCell;
+  if (cellIndex) {
+    var linearCount = Number(table.Range.Cells.Count);
+    if (cellIndex > linearCount) die("cell index out of range; table has " + linearCount + " linear cells");
+    targetCell = table.Range.Cells(cellIndex);
+  } else {
+    var rowCount;
+    var colCount;
+    try { rowCount = Number(table.Rows.Count); } catch (e1) { die("table does not expose regular rows; inspect linear_cells and use --cell: " + e1.message); }
+    try { colCount = Number(table.Columns.Count); } catch (e2) { die("table does not expose regular columns; inspect linear_cells and use --cell: " + e2.message); }
+    if (row > rowCount) die("row index out of range; table has " + rowCount + " rows");
+    if (col > colCount) die("column index out of range; table has " + colCount + " columns");
+    targetCell = table.Cell(row, col);
   }
-  emit("{\"ok\":true,\"action\":\"set-cell\",\"table\":" + tableIndex + ",\"row\":" + row + ",\"col\":" + col + ",\"chars\":" + text.length + "}");
+  try {
+    setCellText(targetCell, text);
+  } catch (e3) {
+    die("failed to set cell: " + e3.message);
+  }
+  emit("{\"ok\":true,\"action\":\"set-cell\",\"table\":" + tableIndex
+    + ",\"cell\":" + (cellIndex || "null") + ",\"row\":" + (row || "null") + ",\"col\":" + (col || "null")
+    + ",\"chars\":" + text.length + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+}
+
+function getGuardedTable(doc, tableIndex) {
+  var tableCount = Number(doc.Tables.Count);
+  if (tableIndex > tableCount) die("table index out of range; document has " + tableCount + " tables");
+  var table = doc.Tables(tableIndex);
+  requireFingerprint(tableFingerprint(table), "--expect-table-fingerprint", "--allow-unverified-target");
+  return table;
+}
+
+function requireTableTrackChangesOff(doc, operation) {
+  if (Boolean(doc.TrackRevisions) && !hasFlag("--allow-track-changes")) {
+    die(operation + " requires Track Changes to be off for deterministic table structure; use --allow-track-changes only after explicit approval");
+  }
+}
+
+function commandSwapCellText() {
+  requireYes();
+  var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
+  var word = getWord();
+  var doc = getMutationDocument(word);
+  requireTableTrackChangesOff(doc, "swap-cell-text");
+  var table = getGuardedTable(doc, tableIndex);
+  var from = resolveTableCell(table, "--from-cell", "--from-row", "--from-col", "source cell");
+  var to = resolveTableCell(table, "--to-cell", "--to-row", "--to-col", "destination cell");
+  if (Number(from.cell.Range.Start) === Number(to.cell.Range.Start)) die("source and destination cells must differ");
+  var fromText = cleanCellText(from.cell.Range.Text);
+  var toText = cleanCellText(to.cell.Range.Text);
+  var rollbackFailures = [];
+  try {
+    setCellText(from.cell, toText);
+    setCellText(to.cell, fromText);
+    if (cleanCellText(from.cell.Range.Text) !== toText || cleanCellText(to.cell.Range.Text) !== fromText) {
+      throw new Error("cell text readback did not match the requested swap");
+    }
+  } catch (e1) {
+    try { setCellText(from.cell, fromText); } catch (e2) { rollbackFailures.push("source:" + (e2.message || String(e2))); }
+    try { setCellText(to.cell, toText); } catch (e3) { rollbackFailures.push("destination:" + (e3.message || String(e3))); }
+    die("failed to swap cell text: " + (e1.message || String(e1)) + (rollbackFailures.length ? "; rollback failures: " + rollbackFailures.join("; ") : "; changes rolled back"));
+  }
+  emit("{\"ok\":true,\"action\":\"swap-cell-text\",\"table\":" + tableIndex
+    + ",\"from\":" + cellTargetJson(from) + ",\"to\":" + cellTargetJson(to)
+    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+}
+
+function commandInsertRow() {
+  requireYes();
+  var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
+  var beforeText = opt("--before", "");
+  var atEnd = hasFlag("--at-end");
+  if (Boolean(beforeText) === atEnd) die("insert-row requires exactly one of --before n or --at-end");
+  var word = getWord();
+  var doc = getMutationDocument(word);
+  requireTableTrackChangesOff(doc, "insert-row");
+  var table = getGuardedTable(doc, tableIndex);
+  var dimensions = getRegularTableDimensions(table, "insert-row");
+  var before = beforeText ? parsePositiveInt(beforeText, "--before") : 0;
+  if (before > dimensions.rows) die("--before row is out of range; table has " + dimensions.rows + " rows");
+  try {
+    if (atEnd) table.Rows.Add();
+    else table.Rows.Add(table.Rows(before));
+  } catch (e) {
+    die("failed to insert row: " + e.message);
+  }
+  var after = getRegularTableDimensions(table, "insert-row readback");
+  if (after.rows !== dimensions.rows + 1 || after.cols !== dimensions.cols) {
+    failJson("{\"ok\":false,\"action\":\"insert-row\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
+  }
+  emit("{\"ok\":true,\"action\":\"insert-row\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
+    + ",\"at_end\":" + boolJson(atEnd) + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols
+    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+}
+
+function commandDeleteRow() {
+  requireYes();
+  var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
+  var row = parsePositiveInt(opt("--row", "0"), "--row");
+  var word = getWord();
+  var doc = getMutationDocument(word);
+  requireTableTrackChangesOff(doc, "delete-row");
+  var table = getGuardedTable(doc, tableIndex);
+  var dimensions = getRegularTableDimensions(table, "delete-row");
+  if (dimensions.rows <= 1) die("refusing to delete the last row; use delete-table when deleting the whole table is intended");
+  if (row > dimensions.rows) die("row index out of range; table has " + dimensions.rows + " rows");
+  try { table.Rows(row).Delete(); } catch (e) { die("failed to delete row: " + e.message); }
+  var after = getRegularTableDimensions(table, "delete-row readback");
+  if (after.rows !== dimensions.rows - 1 || after.cols !== dimensions.cols) {
+    failJson("{\"ok\":false,\"action\":\"delete-row\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
+  }
+  emit("{\"ok\":true,\"action\":\"delete-row\",\"table\":" + tableIndex + ",\"deleted_row\":" + row
+    + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+}
+
+function commandInsertColumn() {
+  requireYes();
+  var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
+  var beforeText = opt("--before", "");
+  var atEnd = hasFlag("--at-end");
+  if (Boolean(beforeText) === atEnd) die("insert-column requires exactly one of --before n or --at-end");
+  var word = getWord();
+  var doc = getMutationDocument(word);
+  requireTableTrackChangesOff(doc, "insert-column");
+  var table = getGuardedTable(doc, tableIndex);
+  var dimensions = getRegularTableDimensions(table, "insert-column");
+  var before = beforeText ? parsePositiveInt(beforeText, "--before") : 0;
+  if (before > dimensions.cols) die("--before column is out of range; table has " + dimensions.cols + " columns");
+  try {
+    if (atEnd) table.Columns.Add();
+    else table.Columns.Add(table.Columns(before));
+  } catch (e) {
+    die("failed to insert column: " + e.message);
+  }
+  var after = getRegularTableDimensions(table, "insert-column readback");
+  if (after.cols !== dimensions.cols + 1 || after.rows !== dimensions.rows) {
+    failJson("{\"ok\":false,\"action\":\"insert-column\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
+  }
+  emit("{\"ok\":true,\"action\":\"insert-column\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
+    + ",\"at_end\":" + boolJson(atEnd) + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols
+    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+}
+
+function commandDeleteColumn() {
+  requireYes();
+  var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
+  var col = parsePositiveInt(opt("--col", "0"), "--col");
+  var word = getWord();
+  var doc = getMutationDocument(word);
+  requireTableTrackChangesOff(doc, "delete-column");
+  var table = getGuardedTable(doc, tableIndex);
+  var dimensions = getRegularTableDimensions(table, "delete-column");
+  if (dimensions.cols <= 1) die("refusing to delete the last column; use delete-table when deleting the whole table is intended");
+  if (col > dimensions.cols) die("column index out of range; table has " + dimensions.cols + " columns");
+  try { table.Columns(col).Delete(); } catch (e) { die("failed to delete column: " + e.message); }
+  var after = getRegularTableDimensions(table, "delete-column readback");
+  if (after.cols !== dimensions.cols - 1 || after.rows !== dimensions.rows) {
+    failJson("{\"ok\":false,\"action\":\"delete-column\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
+  }
+  emit("{\"ok\":true,\"action\":\"delete-column\",\"table\":" + tableIndex + ",\"deleted_col\":" + col
+    + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+}
+
+function commandSetCellShading() {
+  requireYes();
+  var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
+  var colorHex = String(opt("--color", "")).replace(/^#/, "").toUpperCase();
+  var color = parseHexColor(colorHex);
+  var word = getWord();
+  var doc = getMutationDocument(word);
+  var table = getGuardedTable(doc, tableIndex);
+  var target = resolveTableCell(table, "--cell", "--row", "--col", "shading target");
+  var shading = target.cell.Shading;
+  var previousColor = Number(shading.BackgroundPatternColor);
+  var previousTexture = Number(shading.Texture);
+  try {
+    shading.Texture = 0; // wdTextureNone: retain a solid background without a pattern.
+    shading.BackgroundPatternColor = color;
+    if (Number(shading.Texture) !== 0 || Number(shading.BackgroundPatternColor) !== Number(color)) {
+      throw new Error("shading readback did not match requested texture or color");
+    }
+  } catch (e1) {
+    var rollback = [];
+    try { shading.Texture = previousTexture; } catch (e2) { rollback.push("texture:" + (e2.message || String(e2))); }
+    try { shading.BackgroundPatternColor = previousColor; } catch (e3) { rollback.push("color:" + (e3.message || String(e3))); }
+    die("failed to set cell shading: " + (e1.message || String(e1)) + (rollback.length ? "; rollback failures: " + rollback.join("; ") : "; changes rolled back"));
+  }
+  emit("{\"ok\":true,\"action\":\"set-cell-shading\",\"table\":" + tableIndex + ",\"target\":" + cellTargetJson(target)
+    + ",\"color\":" + q(colorHex) + ",\"color_value\":" + color + ",\"texture\":0"
+    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+}
+
+function commandSetBorders(scope) {
+  requireYes();
+  var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
+  var styleName = String(opt("--style", "single")).toLowerCase();
+  var lineStyle = parseBorderStyle(styleName);
+  var edges = parseBorderEdges(opt("--edges", ""), scope);
+  var colorHex = null;
+  var color = 0;
+  var widthText = null;
+  var lineWidth = 4;
+  if (lineStyle !== 0) {
+    colorHex = String(opt("--color", "000000")).replace(/^#/, "").toUpperCase();
+    color = parseHexColor(colorHex);
+    widthText = String(opt("--width", "0.5"));
+    lineWidth = parseBorderWidth(widthText);
+  }
+  var word = getWord();
+  var doc = getMutationDocument(word);
+  var table = getGuardedTable(doc, tableIndex);
+  var target = null;
+  var borders;
+  if (scope === "table") {
+    borders = table.Borders;
+  } else {
+    target = resolveTableCell(table, "--cell", "--row", "--col", "border target");
+    borders = target.cell.Borders;
+  }
+  var result = applyBordersAtomically(borders, edges.types, color, lineWidth, lineStyle);
+  var payload = "{\"ok\":" + boolJson(result.failures.length === 0) + ",\"action\":" + q("set-" + scope + "-borders")
+    + ",\"table\":" + tableIndex + ",\"target\":" + (target ? cellTargetJson(target) : "null")
+    + ",\"edges\":" + stringArrayJson(edges.names) + ",\"style\":" + q(styleName) + ",\"line_style\":" + lineStyle
+    + ",\"color\":" + (colorHex ? q(colorHex) : "null") + ",\"width_points\":" + (widthText ? q(widthText) : "null")
+    + ",\"line_width\":" + (lineStyle !== 0 ? lineWidth : "null")
+    + ",\"failure_count\":" + result.failures.length + ",\"failures\":" + stringArrayJson(result.failures)
+    + ",\"rolled_back\":" + boolJson(result.rolledBack) + ",\"rollback_failures\":" + stringArrayJson(result.rollbackFailures)
+    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}";
+  if (result.failures.length) failJson(payload, 3);
+  emit(payload);
 }
 
 function commandDeleteTable() {
   requireYes();
   var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   var tableCount = Number(doc.Tables.Count);
   if (tableIndex > tableCount) die("table index out of range; document has " + tableCount + " tables");
+  var table = doc.Tables(tableIndex);
+  requireFingerprint(tableFingerprint(table), "--expect-table-fingerprint", "--allow-unverified-target");
   try {
-    doc.Tables(tableIndex).Delete();
+    table.Delete();
   } catch (e) {
     die("failed to delete table: " + e.message);
   }
@@ -541,41 +1228,45 @@ function commandNormalizeTableBorders() {
   requireYes();
   var tableIndex = parsePositiveInt(opt("--table", "1"), "--table");
   var colorHex = opt("--color", "D9DEE8");
-  var lineWidth = parseInt(opt("--line-width", "4"), 10);
-  if (!lineWidth || lineWidth < 1) die("--line-width must be a positive integer Word line-width constant");
+  var lineWidth = parsePositiveInt(opt("--line-width", "4"), "--line-width");
   var color = parseHexColor(colorHex);
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   var tableCount = Number(doc.Tables.Count);
   if (tableIndex > tableCount) die("table index out of range; document has " + tableCount + " tables");
   var table = doc.Tables(tableIndex);
+  requireFingerprint(tableFingerprint(table), "--expect-table-fingerprint", "--allow-unverified-target");
   var tableBorderTypes = [-1, -2, -3, -4, -5, -6]; // top, left, bottom, right, insideH, insideV
   var cellBorderTypes = [-1, -2, -3, -4];
   var cellCount = 0;
-  var cellErrors = 0;
+  var failures = [];
 
-  setBorderCollection(table.Borders, tableBorderTypes, color, lineWidth);
-  try { table.Borders.Enable = true; } catch (e1) {}
+  failures = failures.concat(setBorderCollection(table.Borders, tableBorderTypes, color, lineWidth, "table"));
+  try { table.Borders.Enable = true; } catch (e1) { failures.push("table-enable:" + (e1.message || String(e1))); }
 
   try {
     cellCount = Number(table.Range.Cells.Count);
     for (var i = 1; i <= cellCount; i++) {
       try {
-        setBorderCollection(table.Range.Cells(i).Borders, cellBorderTypes, color, lineWidth);
+        failures = failures.concat(setBorderCollection(table.Range.Cells(i).Borders, cellBorderTypes, color, lineWidth, "cell[" + i + "]"));
       } catch (e2) {
-        cellErrors++;
+        failures.push("cell[" + i + "]:" + (e2.message || String(e2)));
       }
     }
   } catch (e3) {
-    cellErrors++;
+    failures.push("cell-enumeration:" + (e3.message || String(e3)));
   }
 
-  emit("{\"ok\":true,\"action\":\"normalize-table-borders\",\"table\":" + tableIndex
+  var payload = "{\"ok\":" + boolJson(failures.length === 0) + ",\"action\":\"normalize-table-borders\",\"table\":" + tableIndex
     + ",\"tables\":" + tableCount
     + ",\"cells_seen\":" + cellCount
-    + ",\"cell_errors\":" + cellErrors
+    + ",\"failure_count\":" + failures.length
+    + ",\"failures\":" + stringArrayJson(failures)
     + ",\"color\":" + q(colorHex)
-    + ",\"line_width\":" + lineWidth + "}");
+    + ",\"line_width\":" + lineWidth
+    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}";
+  if (failures.length) failJson(payload, 3);
+  emit(payload);
 }
 
 function commandInsertEquation() {
@@ -583,17 +1274,20 @@ function commandInsertEquation() {
   var linearText = equationInputText();
   if (!linearText) die("equation input is empty after conversion");
   var at = opt("--at", "selection");
+  if (at !== "selection" && at !== "end") die("--at must be selection or end");
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   var range;
   if (at === "end") range = doc.Range(doc.Content.End - 1, doc.Content.End - 1);
-  else range = word.Selection.Range;
+  else range = requireExpectedSelection(word, true).range;
   try {
-    buildEquationInRange(doc, range, linearText);
+    var equation = buildEquationInRange(doc, range, linearText);
   } catch (e) {
     die("failed to insert equation: " + e.message);
   }
-  emit("{\"ok\":true,\"action\":\"insert-equation\",\"linear\":" + q(linearText) + ",\"equation_count\":" + Number(doc.OMaths.Count) + "}");
+  emit("{\"ok\":true,\"action\":\"insert-equation\",\"linear\":" + q(linearText)
+    + ",\"equation_count\":" + Number(doc.OMaths.Count)
+    + ",\"fingerprint\":" + q(equationFingerprint(equation.OMaths(1))) + "}");
 }
 
 function commandSetEquation() {
@@ -602,9 +1296,10 @@ function commandSetEquation() {
   var linearText = equationInputText();
   if (!linearText) die("equation input is empty after conversion");
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   var count = Number(doc.OMaths.Count);
   if (idx > count) die("equation index out of range; document has " + count + " equations");
+  requireFingerprint(equationFingerprint(doc.OMaths(idx)), "--expect-equation-fingerprint", "--allow-unverified-target");
   try {
     var oldRange = doc.OMaths(idx).Range;
     var range = doc.Range(oldRange.Start, oldRange.End);
@@ -612,16 +1307,19 @@ function commandSetEquation() {
   } catch (e) {
     die("failed to set equation: " + e.message);
   }
-  emit("{\"ok\":true,\"action\":\"set-equation\",\"index\":" + idx + ",\"linear\":" + q(linearText) + ",\"equation_count\":" + Number(doc.OMaths.Count) + "}");
+  emit("{\"ok\":true,\"action\":\"set-equation\",\"index\":" + idx + ",\"linear\":" + q(linearText)
+    + ",\"equation_count\":" + Number(doc.OMaths.Count)
+    + ",\"fingerprint\":" + q(equationFingerprint(doc.OMaths(idx))) + "}");
 }
 
 function commandDeleteEquation() {
   requireYes();
   var idx = parsePositiveInt(opt("--index", "0"), "--index");
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   var count = Number(doc.OMaths.Count);
   if (idx > count) die("equation index out of range; document has " + count + " equations");
+  requireFingerprint(equationFingerprint(doc.OMaths(idx)), "--expect-equation-fingerprint", "--allow-unverified-target");
   try {
     doc.OMaths(idx).Range.Delete();
   } catch (e) {
@@ -633,7 +1331,7 @@ function commandDeleteEquation() {
 function commandSaveActive() {
   requireYes();
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   try {
     doc.Save();
   } catch (e) {
@@ -647,17 +1345,13 @@ function commandCloseActive() {
   var save = hasFlag("--save");
   var discard = hasFlag("--discard");
   if (save === discard) die("close-active requires exactly one of --save or --discard");
+  if (hasFlag("--quit-if-empty")) die("--quit-if-empty is disabled; normal commands must not quit a user-owned Word instance");
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
   var path = safeDocPath(doc);
   try {
     if (save) doc.Save();
     doc.Close(false);
-    if (hasFlag("--quit-if-empty") && Number(word.Documents.Count) === 0) {
-      word.Quit(0);
-      word = null;
-      try { CollectGarbage(); } catch (e2) {}
-    }
   } catch (e) {
     die("failed to close active document: " + e.message);
   }
@@ -666,20 +1360,26 @@ function commandCloseActive() {
 
 function commandSaveCopy() {
   requireYes();
-  var path = absPath(opt("--path", ""));
-  if (!path) die("save-copy requires --path file");
+  var path = prepareOutputPath(opt("--path", ""), "save-copy");
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
+  var source = safeDocPath(doc);
+  if (source && canonicalPath(source) === canonicalPath(path)) die("backup path must differ from the active document path");
+  var savedBefore = false;
+  try { savedBefore = Boolean(doc.Saved); } catch (e0) {}
+  if (fso.FileExists(path) && hasFlag("--overwrite")) fso.DeleteFile(path, true);
   try {
     doc.SaveCopyAs(path);
-    emit("{\"ok\":true,\"action\":\"save-copy\",\"method\":\"SaveCopyAs\",\"path\":" + q(path) + "}");
+    emit("{\"ok\":true,\"action\":\"save-copy\",\"method\":\"SaveCopyAs\",\"path\":" + q(path)
+      + ",\"document_saved_before\":" + boolJson(savedBefore) + ",\"includes_current_document_state\":true}");
     return;
   } catch (e) {
-    var source = safeDocPath(doc);
     if (!source || !fso.FileExists(source)) die("failed to save copy and active document has no saved source path: " + e.message);
+    if (!savedBefore) die("failed to save a copy while the active document has unsaved changes; refusing stale disk-copy fallback: " + e.message);
     try {
-      fso.CopyFile(source, path, true);
-      emit("{\"ok\":true,\"action\":\"save-copy\",\"method\":\"FileSystemObject.CopyFile\",\"path\":" + q(path) + ",\"source\":" + q(source) + "}");
+      fso.CopyFile(source, path, false);
+      emit("{\"ok\":true,\"action\":\"save-copy\",\"method\":\"FileSystemObject.CopyFile\",\"path\":" + q(path)
+        + ",\"source\":" + q(source) + ",\"document_saved_before\":true,\"includes_current_document_state\":true}");
       return;
     } catch (e2) {
       die("failed to save copy: " + e.message + "; fallback failed: " + e2.message);
@@ -689,10 +1389,10 @@ function commandSaveCopy() {
 
 function commandExportPdf() {
   requireYes();
-  var path = absPath(opt("--path", ""));
-  if (!path) die("export-pdf requires --path file");
+  var path = prepareOutputPath(opt("--path", ""), "export-pdf");
   var word = getWord();
-  var doc = getActiveDocument(word);
+  var doc = getMutationDocument(word);
+  if (fso.FileExists(path) && hasFlag("--overwrite")) fso.DeleteFile(path, true);
   try {
     doc.ExportAsFixedFormat(path, 17);
   } catch (e) {
@@ -716,34 +1416,73 @@ function commandOpen() {
 }
 
 function commandSmoke() {
-  var path = absPath(opt("--path", ""));
-  if (!path) die("smoke requires --path file");
-  var word = new ActiveXObject("Word.Application");
-  word.Visible = false;
-  word.DisplayAlerts = 0;
-  var doc = word.Documents.Add();
-  doc.Content.Text = "Word control smoke test.\rCreated by word_control.js.\r";
+  requireYes();
+  var path = prepareOutputPath(opt("--path", ""), "smoke");
+  if (!/\.docx$/i.test(path)) die("smoke output must use a .docx extension");
+  if (fso.FileExists(path) && hasFlag("--overwrite")) fso.DeleteFile(path, true);
+  var word = null;
+  var doc = null;
+  var tableCount = 0;
+  var equationCount = 0;
+  var failure = null;
   try {
-    doc.SaveAs2(path);
-  } catch (e1) {
-    doc.SaveAs(path);
+    word = new ActiveXObject("Word.Application");
+    word.Visible = false;
+    word.DisplayAlerts = 0;
+    doc = word.Documents.Add();
+    doc.Content.Text = "Word control smoke test.\rCreated by word_control.js.\r";
+
+    var tableRange = doc.Range(doc.Content.End - 1, doc.Content.End - 1);
+    var table = doc.Tables.Add(tableRange, 2, 2);
+    setCellText(table.Cell(1, 1), "A");
+    setCellText(table.Cell(1, 2), "B");
+    setCellText(table.Cell(2, 1), "1");
+    setCellText(table.Cell(2, 2), "2");
+    var borderFailures = setBorderCollection(table.Borders, [-1, -2, -3, -4, -5, -6], parseHexColor("D9DEE8"), 4, "smoke-table");
+    if (borderFailures.length) throw new Error("border smoke failed: " + borderFailures.join("; "));
+
+    var mathRange = doc.Range(doc.Content.End - 1, doc.Content.End - 1);
+    buildEquationInRange(doc, mathRange, "x^2+y^2=z^2");
+    tableCount = Number(doc.Tables.Count);
+    equationCount = Number(doc.OMaths.Count);
+    if (tableCount !== 1 || equationCount !== 1) throw new Error("unexpected smoke object counts");
+
+    try { doc.SaveAs2(path); } catch (e1) { doc.SaveAs(path); }
+    doc.Close(false);
+    doc = null;
+  } catch (e2) {
+    failure = e2;
+  } finally {
+    if (doc !== null) {
+      try { doc.Close(false); } catch (e3) {}
+      doc = null;
+    }
+    if (word !== null) {
+      try { word.Quit(0); } catch (e4) {}
+      word = null;
+    }
+    try { CollectGarbage(); } catch (e5) {}
   }
-  doc.Close(false);
-  word.Quit(0);
-  doc = null;
-  word = null;
-  try { CollectGarbage(); } catch (e2) {}
-  emit("{\"ok\":true,\"action\":\"smoke\",\"path\":" + q(path) + "}");
+  if (failure !== null) {
+    if (fso.FileExists(path)) {
+      try { fso.DeleteFile(path, true); } catch (e6) {}
+    }
+    die("smoke test failed: " + (failure.message || String(failure)));
+  }
+  emit("{\"ok\":true,\"action\":\"smoke\",\"path\":" + q(path)
+    + ",\"table_count\":" + tableCount + ",\"equation_count\":" + equationCount + "}");
 }
 
 try {
   if (COMMAND === "help" || COMMAND === "--help" || COMMAND === "-h") commandHelp();
   else if (COMMAND === "status") commandStatus();
   else if (COMMAND === "selection") commandSelection();
+  else if (COMMAND === "selection-info") commandSelectionInfo();
   else if (COMMAND === "document-text") commandDocumentText();
   else if (COMMAND === "paragraphs") commandParagraphs();
   else if (COMMAND === "tables") commandTables();
   else if (COMMAND === "equations") commandEquations();
+  else if (COMMAND === "convert-equation") commandConvertEquation();
   else if (COMMAND === "enable-track-changes") commandTrack(true);
   else if (COMMAND === "disable-track-changes") commandTrack(false);
   else if (COMMAND === "replace-selection") commandReplaceSelection();
@@ -751,6 +1490,14 @@ try {
   else if (COMMAND === "insert-comment") commandInsertComment();
   else if (COMMAND === "create-table") commandCreateTable();
   else if (COMMAND === "set-cell") commandSetCell();
+  else if (COMMAND === "swap-cell-text") commandSwapCellText();
+  else if (COMMAND === "insert-row") commandInsertRow();
+  else if (COMMAND === "delete-row") commandDeleteRow();
+  else if (COMMAND === "insert-column") commandInsertColumn();
+  else if (COMMAND === "delete-column") commandDeleteColumn();
+  else if (COMMAND === "set-cell-shading") commandSetCellShading();
+  else if (COMMAND === "set-cell-borders") commandSetBorders("cell");
+  else if (COMMAND === "set-table-borders") commandSetBorders("table");
   else if (COMMAND === "delete-table") commandDeleteTable();
   else if (COMMAND === "normalize-table-borders") commandNormalizeTableBorders();
   else if (COMMAND === "insert-equation") commandInsertEquation();
