@@ -33,7 +33,7 @@ Word Control 是一个面向 Windows 桌面版 Microsoft Word 的 Codex 技能�
 - Windows
 - Microsoft Word desktop
 - Windows Script Host (`cscript.exe`)
-- PowerShell for the integration test
+- PowerShell and Node.js for the test suite (ordinary Word commands do not require Node.js)
 
 This is not an Office.js add-in and does not control Word Online.
 
@@ -47,7 +47,8 @@ skills/word-control/
 `-- scripts/
     |-- word_control.js
     |-- test_word_control.ps1
-    `-- test_word_control_integration.js
+    |-- test_word_control_integration.js
+    `-- test_word_control_pure.cjs
 ```
 
 ## Installation
@@ -72,9 +73,15 @@ cscript //nologo $wc equations --output equations.json
 
 Before changing content, use the active document path returned by `status` and the fresh selection or object fingerprint returned by the relevant inspection command. See [the command guide](skills/word-control/references/usage.md) for guarded editing examples and cleanup requirements.
 
+## Guard compatibility
+
+Selection mutations now require `--expect-story-type` from a fresh `selection-info` result, alongside start, end, and text hash. Saved documents require `--expect-path`; filename-only verification is reserved for unsaved documents.
+
+Scratch `--output` files must use `.json`, `.txt`, `.tsv`, or `.log`, must differ from input/document/export paths, and need explicit `--overwrite` to replace an existing file. Incomplete table inspection returns a null fingerprint and must not be used for mutation.
+
 ## Validation
 
-The test creates a separate hidden Word instance and temporary DOCX, exercises text, table, equation, save-copy, and PDF operations, then removes its own artifacts.
+The test runs pure regression checks, creates a separate hidden Word instance and temporary DOCX, exercises text, table, equation, save-copy, and PDF operations, and validates every JSON output with a strict parser. It removes its own artifacts. If Word is already running, command integration is skipped; a skipped result is not a complete validation.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\skills\word-control\scripts\test_word_control.ps1"

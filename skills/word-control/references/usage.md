@@ -31,13 +31,15 @@ If Word cannot create a copy while the source has unsaved changes, the command f
 
 ## Selection Changes
 
-Use `start`, `end`, and `text_hash` from the same fresh `selection-info` result:
+Use `story_type`, `start`, `end`, and `text_hash` from the same fresh `selection-info` result:
 
 ```powershell
-cscript //nologo $wc replace-selection --input revised.txt --track --expect-path "<doc>" --expect-start <start> --expect-end <end> --expect-selection-hash <hash> --yes
+cscript //nologo $wc replace-selection --input revised.txt --track --expect-path "<doc>" --expect-story-type <story_type> --expect-start <start> --expect-end <end> --expect-selection-hash <hash> --yes
 
-cscript //nologo $wc insert-comment --input comment.txt --expect-path "<doc>" --expect-start <start> --expect-end <end> --expect-selection-hash <hash> --yes
+cscript //nologo $wc insert-comment --input comment.txt --expect-path "<doc>" --expect-story-type <story_type> --expect-start <start> --expect-end <end> --expect-selection-hash <hash> --yes
 ```
+
+Snapshots now require `story_type` as well as the three older selection values; refresh old snapshots and command templates. A successful `--track` edit keeps Track Changes on; a failed edit attempts to restore its previous state and reports restoration failures.
 
 Selection changes invalidate the snapshot. Inspect again before a second change. A collapsed selection is rejected unless insertion is deliberate and `--allow-insert` is also supplied.
 
@@ -72,7 +74,7 @@ cscript //nologo $wc delete-table --table 1 --expect-table-fingerprint <hash> --
 
 For `create-table --at selection`, also provide the fresh selection guards. TSV input larger than the requested dimensions is rejected unless `--allow-truncate` is explicit. For merged or irregular tables, use `linear_cells[].index` with `set-cell --cell`; row and column insertion/deletion require a regular table. `swap-cell-text` moves text only, not formatting. Structural operations require Track Changes off unless `--allow-track-changes` is explicitly approved.
 
-Border edges are `top`, `left`, `bottom`, `right`, `inside-h`, and `inside-v`; `outer` expands to the four outside edges and `all` selects every valid edge for the scope. Supported point widths are `0.25`, `0.5`, `0.75`, `1`, `1.5`, `2.25`, `3`, `4.5`, and `6`. Use `--style none` to remove selected edges. Reinspect after each change and use the new fingerprint. `layout_warnings` describe non-rectangular fallback, while `read_errors`, `failure_count`, rollback failures, or a nonzero exit mean the operation is not fully verified.
+Border edges are `top`, `left`, `bottom`, `right`, `inside-h`, and `inside-v`; `outer` expands to the four outside edges and `all` selects every valid edge for the scope. Supported point widths are `0.25`, `0.5`, `0.75`, `1`, `1.5`, `2.25`, `3`, `4.5`, and `6`. Use `--style none` to remove selected edges. Reinspect after each change and use the new fingerprint. `layout_warnings` describe non-rectangular fallback. Fingerprint read failures produce `fingerprint:null` and `inspection_complete:false`; do not mutate from an incomplete inspection. Any `read_errors`, `failure_count`, rollback failures, or a nonzero exit mean the operation is not fully verified.
 
 ## Equations
 
@@ -117,3 +119,7 @@ Use exactly one of `--save` or `--discard` with `close-active`. It closes only t
 ## Cleanup
 
 Delete only task-generated status, selection, table, equation, conversion, and input scratch files after verification. Keep the original DOCX, explicit backups, requested PDF/PNG previews, and anything needed for rollback or audit.
+
+## Maintenance
+
+The `.codex` installation is the source of truth. Back up all installations, edit and fully test `.codex`, then copy its files to `.agents` and `.grok` and compare SHA-256 hashes. The copied command examples intentionally continue to target the canonical `.codex` entry point. Do not synchronize after failed or skipped integration tests.

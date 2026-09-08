@@ -12,7 +12,7 @@ Work directly in desktop Microsoft Word while preserving the user's existing doc
 1. Run `status` and confirm the active document name, full path, save state, read-only state, and protection state.
 2. For an important document, create a new versioned backup with `save-copy` before editing. If the document has unsaved changes and backup fails, do not silently save or use a stale disk copy; ask whether to save the source or proceed without a backup.
 3. Inspect the exact target immediately before mutation:
-   - Text or comments: run `selection-info` and retain `start`, `end`, and `text_hash`.
+   - Text or comments: run `selection-info` and retain `story_type`, `start`, `end`, and `text_hash`.
    - Tables: run `tables` and retain the target table's `fingerprint`.
    - Equations: run `equations` and retain the target equation's `fingerprint`.
 4. Put non-ASCII input in a task-local UTF-8 file. Use an isolated temporary folder, not the document's source folder unless necessary.
@@ -24,13 +24,23 @@ Work directly in desktop Microsoft Word while preserving the user's existing doc
 ## Non-Negotiable Guards
 
 - Require `--expect-path` for saved documents. Use `--expect-name` only for an intentionally unsaved document.
-- Require all three selection values from one fresh `selection-info` result: `--expect-start`, `--expect-end`, and `--expect-selection-hash`.
+- Require all four selection values from one fresh `selection-info` result: `--expect-story-type`, `--expect-start`, `--expect-end`, and `--expect-selection-hash`.
 - Require `--expect-table-fingerprint` or `--expect-equation-fingerprint` from a fresh inspection before indexed object changes.
 - Treat `--allow-active`, `--allow-unverified-selection`, `--allow-unverified-target`, and `--allow-insert` as exceptional overrides. Use them only after manual target verification and only when their specific behavior is intended.
 - Refuse an existing backup, PDF, or smoke-test output unless the user explicitly approved replacement and `--overwrite` is passed.
 - Do not use `replace-paragraph`; it is disabled because Word paragraph ranges can duplicate or shift content. Select the exact range and use `replace-selection`.
 - Do not infer that a collapsed selection is intended. Insertion at the cursor requires explicit `--allow-insert`.
 - Do not close documents, dismiss dialogs, or alter Track Changes unless required by the user's request.
+
+## Medical Manuscript Formatting Gate
+
+When the active document is a medical manuscript, default to text-only editing. Do not add styling while inserting or replacing the title, headings, subheadings, or body text.
+
+- Keep inserted manuscript text in an ordinary non-heading paragraph. Do not create Word heading/outline levels, collapsible sections, automatic numbering, multilevel lists, or added paragraph-number punctuation.
+- Do not add bold, italics, underlining, font/size/color changes, alignment, indentation, paragraph spacing, line spacing, borders, shading, or page breaks unless the user explicitly requests that exact change.
+- Preserve the formatting already attached to an edited range or paragraph. Do not normalize, restyle, or strip the rest of the document during a narrow text edit.
+- Formatting commands are allowed for a manuscript only when the user explicitly requests them or explicitly requests pre-submission formatting for a named journal whose current mandatory requirements have been verified.
+- In submission mode, apply only mandatory requirements. If a requirement is uncertain, leave the text plain and ask for or verify the journal instruction rather than guessing.
 
 ## Entry Point
 
@@ -39,7 +49,7 @@ $wc = "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js"
 cscript //nologo $wc help
 ```
 
-Use `--output` for Chinese text or long output because the console code page can corrupt display text.
+Use `--output` for Chinese text or long output because the console code page can corrupt display text. Output must use `.json`, `.txt`, `.tsv`, or `.log`, must differ from input/document/export paths, and requires explicit `--overwrite` to replace an existing scratch file.
 
 ## Operation Routing
 
@@ -65,17 +75,19 @@ TSV dimensions must fit the requested table. Use `--allow-truncate` only when th
 
 Use `swap-cell-text` only to exchange textual contents while preserving each cell's formatting. Use explicit row/column insertion and deletion commands for structural changes; they reject deletion of the final row or column. Keep Track Changes off for deterministic structural changes unless the user explicitly approves `--allow-track-changes`.
 
-Use `set-cell-shading` for a solid RGB background. Use `set-cell-borders` for selected cell edges and `set-table-borders` for outer or internal table edges. Supported border styles are `none`, `single`, `dotted`, `dashed`, `dash-large`, `dash-dot`, `dash-dot-dot`, `double`, and `triple`; supported widths are the Word-native point values listed in the command guide. Formatting changes are included in the table fingerprint. `layout_warnings` document fallback behavior, while any `read_errors`, `failures`, or rollback failures mean the operation is incomplete and must not be reported as successful.
+Use `set-cell-shading` for a solid RGB background. Use `set-cell-borders` for selected cell edges and `set-table-borders` for outer or internal table edges. Supported border styles are `none`, `single`, `dotted`, `dashed`, `dash-large`, `dash-dot`, `dash-dot-dot`, `double`, and `triple`; supported widths are the Word-native point values listed in the command guide. Formatting changes are included in the table fingerprint. `layout_warnings` document fallback behavior, while a null fingerprint, `inspection_complete:false`, any `read_errors`, `failures`, or rollback failures mean the operation is incomplete and must not be reported as successful.
 
 ## Verification
 
-Run the isolated test after changing this skill:
+The `.codex` copy is the maintenance source. Validate it before copying the complete skill to `.agents` and `.grok`; do not maintain divergent instructions in those copies.
+
+Run the isolated test after changing this skill (Windows desktop Word and Node.js are required for testing; ordinary commands still use only Windows Script Host):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\skills\word-control\scripts\test_word_control.ps1"
 ```
 
-The test creates its own hidden Word instance and a unique temporary DOCX, then removes its artifacts. It must not attach to or close the user's Word session.
+The test runs pure regressions, creates its own hidden Word instance and a unique temporary DOCX, and strictly parses every generated JSON output before removing its artifacts. Existing Word sessions cause command integration to be skipped; a skipped result does not authorize synchronization. It must not attach to or close the user's Word session.
 
 ## Limitations
 
