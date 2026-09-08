@@ -64,7 +64,14 @@ function execute(args) {
   var parts = ["cscript", "//nologo", quoteArg(bridge)];
   for (var i = 0; i < args.length; i++) parts.push(quoteArg(args[i]));
   var process = shell.Exec(parts.join(" "));
-  while (process.Status === 0) WScript.Sleep(20);
+  var deadline = new Date().getTime() + 120000;
+  while (process.Status === 0) {
+    if (new Date().getTime() > deadline) {
+      process.Terminate();
+      throw new Error("command timed out; bridge process terminated (Word ownership remains with test)");
+    }
+    WScript.Sleep(20);
+  }
   return {
     code: Number(process.ExitCode),
     stdout: process.StdOut.ReadAll(),
@@ -261,6 +268,7 @@ function runFixture(path) {
   word.Selection.SetRange(insertionPosition, insertionPosition);
   var collapsed = runJson(["selection-info"], "fixture-collapsed-selection.json");
   var collapsedGuards = [
+    "--expect-story-type", String(collapsed.selection.story_type),
     "--expect-start", String(collapsed.selection.start),
     "--expect-end", String(collapsed.selection.end),
     "--expect-selection-hash", String(collapsed.selection.text_hash)
@@ -275,6 +283,7 @@ function runFixture(path) {
   sentinelRange.Select();
   var selectedSentinel = runJson(["selection-info"], "fixture-sentinel-selection.json");
   var sentinelGuards = [
+    "--expect-story-type", String(selectedSentinel.selection.story_type),
     "--expect-start", String(selectedSentinel.selection.start),
     "--expect-end", String(selectedSentinel.selection.end),
     "--expect-selection-hash", String(selectedSentinel.selection.text_hash)
@@ -288,6 +297,7 @@ function runFixture(path) {
   sentinelRange.Select();
   selectedSentinel = runJson(["selection-info"], "fixture-sentinel-selection-track.json");
   sentinelGuards = [
+    "--expect-story-type", String(selectedSentinel.selection.story_type),
     "--expect-start", String(selectedSentinel.selection.start),
     "--expect-end", String(selectedSentinel.selection.end),
     "--expect-selection-hash", String(selectedSentinel.selection.text_hash)
@@ -398,20 +408,36 @@ try {
   word.Visible = false;
   word.DisplayAlerts = 0;
   doc = word.Documents.Add();
-  doc.Content.Text = "seed text\r";
+  doc.Content.Text = "seed text\rsoft\vline\rpage\fbreak\r";
   try { doc.SaveAs2(docPath); } catch (saveError) { doc.SaveAs(docPath); }
 
   word.Selection.SetRange(0, 4);
+  runJson(["paragraphs"], "control-character-paragraphs.json");
   var selection = runJson(["selection-info"], "selection-info.json");
   assertTrue(String(selection.document.path).toLowerCase() === docPath.toLowerCase(), "selection inspection targeted the wrong document");
   assertTrue(String(selection.selection.text_hash).length === 8, "selection hash was not emitted");
 
   var selectionArgs = [
+    "--expect-story-type", String(selection.selection.story_type),
     "--expect-start", String(selection.selection.start),
     "--expect-end", String(selection.selection.end),
     "--expect-selection-hash", String(selection.selection.text_hash)
   ];
   requireFailure(["replace-selection", "--input", replacementInput, "--expect-path", wrongPath].concat(selectionArgs, ["--yes"]));
+  requireFailure(["replace-selection", "--input", replacementInput, "--expect-name", String(doc.Name)].concat(selectionArgs, ["--yes"]));
+  requireFailure(["replace-selection", "--input", replacementInput, "--expect-path", docPath, "--output", docPath, "--overwrite"].concat(selectionArgs, ["--yes"]));
+  assertTrue(String(doc.Content.Text).indexOf("seed") === 0, "output preflight changed the document");
+
+  var header = doc.Sections(1).Headers(1).Range;
+  header.Text = "seed";
+  header.End = header.Start + 4;
+  header.Select();
+  var headerSelection = runJson(["selection-info"], "header-selection.json");
+  assertTrue(headerSelection.selection.story_type !== selection.selection.story_type, "header did not expose a different story");
+  requireFailure(["replace-selection", "--input", replacementInput, "--expect-path", docPath].concat(selectionArgs, ["--yes"]));
+  assertTrue(String(doc.Sections(1).Headers(1).Range.Text).indexOf("seed") === 0, "stale main-story guards changed the header");
+  doc.Range(0, 4).Select();
+
 
   var replacement = runJson([
     "replace-selection", "--input", replacementInput, "--expect-path", docPath

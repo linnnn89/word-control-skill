@@ -7,6 +7,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $bridge = Join-Path $PSScriptRoot 'word_control.js'
 $integrationBridge = Join-Path $PSScriptRoot 'test_word_control_integration.js'
+$pureBridge = Join-Path $PSScriptRoot 'test_word_control_pure.cjs'
+$nodeExecutable = (Get-Command node -ErrorAction Stop).Source
 $createdRoot = -not (Test-Path -LiteralPath $TempRoot)
 $runDir = Join-Path $TempRoot (Get-Date -Format 'yyyyMMdd_HHmmss_fff')
 $wordPidsBefore = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
@@ -78,6 +80,10 @@ function Wait-ForOwnedWordExit {
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
 
 try {
+    $pureOutput = & $nodeExecutable $pureBridge
+    if ($LASTEXITCODE -ne 0) { throw 'pure regression checks failed' }
+    $pureResult = ($pureOutput -join [Environment]::NewLine) | ConvertFrom-Json
+    if (-not $pureResult.ok) { throw 'pure regression checks did not report success' }
     $equationInput = Join-Path $runDir 'equation.txt'
     [IO.File]::WriteAllText($equationInput, '\frac{a+b}{c} + \alpha', [Text.UTF8Encoding]::new($false))
     $convertedOutput = Join-Path $runDir 'converted-equation.json'
@@ -189,8 +195,17 @@ try {
         }
     }
 
+    # WSH eval and ConvertFrom-Json both accept some non-JSON control characters.
+    # Validate every generated JSON artifact with the standard Node JSON parser.
+    $strictOutput = & $nodeExecutable $pureBridge --validate-json-dir $runDir
+    if ($LASTEXITCODE -ne 0) { throw 'strict JSON validation failed' }
+    $strictResult = ($strictOutput -join [Environment]::NewLine) | ConvertFrom-Json
+    if (-not $strictResult.ok) { throw 'strict JSON validation did not report success' }
+
     [pscustomobject]@{
         ok = $true
+        pure_regression_groups = $pureResult.pure_regression_groups
+        strict_json_files = $strictResult.strict_json_files
         equation_conversion = 'passed'
         unsupported_equation_rejection = 'passed'
         paragraph_replacement_disabled = 'passed'
