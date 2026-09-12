@@ -198,9 +198,83 @@ if (fixtureCopy && !fso.FileExists(fixtureCopy)) throw new Error("fixture copy n
 var word = null;
 var doc = null;
 var failure = null;
-var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"backup":true,"pdf":true,"close":true}';
+var savedWordOptions = {};
+var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"backup":true,"pdf":true,"close":true}';
+
+function exerciseScopedInspection() {
+  var queryDoc = word.Documents.Add();
+  try {
+    queryDoc.Content.Text = "first\r\u7b2c\u4e8c\u6bb5\rthird\rfourth\rfifth\rsixth\r";
+    queryDoc.Tables.Add(queryDoc.Range(queryDoc.Content.End - 1, queryDoc.Content.End - 1), 2, 2);
+    queryDoc.Content.InsertAfter("\r");
+    var queryTable = queryDoc.Tables.Add(queryDoc.Range(queryDoc.Content.End - 1, queryDoc.Content.End - 1), 3, 3);
+    for (var c = 1; c <= 9; c++) {
+      var cellRange = queryTable.Range.Cells(c).Range;
+      cellRange.End--;
+      cellRange.Text = "DETAIL_" + c + " " + new Array(30).join("sample text ");
+    }
+    queryTable.Cell(1, 1).Merge(queryTable.Cell(1, 2));
+    var queryPath = fso.BuildPath(testDir, "scoped-inspection.docx");
+    try { queryDoc.SaveAs2(queryPath); } catch (saveError) { queryDoc.SaveAs(queryPath); }
+    queryDoc.Activate();
+    queryDoc.Range(0, 5).Select();
+    var textBefore = String(queryDoc.Content.Text);
+    var selectionStart = Number(word.Selection.Start);
+    var selectionEnd = Number(word.Selection.End);
+    var savedBefore = Boolean(queryDoc.Saved);
+
+    var page = runJson(["paragraphs", "--from", "2", "--max", "2"], "scoped-paragraphs.json");
+    assertTrue(page.returned === 2 && page.from === 2 && page.next_from === 4, "paragraph pagination metadata mismatch");
+    assertTrue(page.paragraphs[0].index === 2 && page.paragraphs[0].text === "\u7b2c\u4e8c\u6bb5\n", "paragraph page lost absolute index or Unicode text");
+    assertTrue(page.paragraphs[1].text === "third\n", "paragraph page returned the wrong range");
+    var empty = runJson(["paragraphs", "--from", String(Number(queryDoc.Paragraphs.Count) + 1)], "scoped-paragraphs-end.json");
+    assertTrue(empty.returned === 0 && empty.next_from === null, "paragraph pagination did not stop at the end");
+
+    var all = runJson(["tables"], "scoped-tables-all.json");
+    var target = runJson(["tables", "--table", "2"], "scoped-table-full.json");
+    assertTrue(all.table_count === 2 && all.returned === 2 && target.returned === 1, "single-table query changed collection counts");
+    assertTrue(target.tables[0].index === 2 && target.tables[0].fingerprint === all.tables[1].fingerprint, "single-table query returned a different target");
+    assertTrue(target.tables[0].layout === "irregular" && target.tables[0].linear_cells.length === 8, "targeted query lost merged-table support");
+    assertTrue(target.tables[0].inspection_complete && target.tables[0].read_errors.length === 0, "targeted full inspection was incomplete");
+    var textOnly = runJson(["tables", "--detail", "text"], "scoped-tables-text.json");
+    assertTrue(textOnly.returned === all.returned && textOnly.detail === "text", "text inspection scope mismatch");
+    for (var t = 0; t < all.tables.length; t++) {
+      var expected = all.tables[t];
+      var actual = textOnly.tables[t];
+      assertTrue(actual.layout === expected.layout && actual.cell_count === expected.cell_count, "text inspection changed table layout");
+      assertTrue(actual.fingerprint === null && actual.inspection_complete === false, "text inspection exposed a mutation guard");
+      assertTrue(actual.read_errors.length === 0, "text inspection failed");
+      for (var row = 0; row < expected.cells.length; row++) {
+        for (var col = 0; col < expected.cells[row].length; col++) {
+          assertTrue(actual.cells[row][col] === expected.cells[row][col], "text inspection changed rectangular cell text");
+        }
+      }
+      assertTrue(actual.linear_cells.length === expected.linear_cells.length, "text inspection lost merged cells");
+      for (var cell = 0; cell < expected.linear_cells.length; cell++) {
+        var a = actual.linear_cells[cell], b = expected.linear_cells[cell];
+        assertTrue(a.index === b.index && a.row === b.row && a.col === b.col && a.text === b.text, "text inspection changed merged cell metadata");
+      }
+    }
+    var summary = runJson(["tables", "--table", "2", "--detail", "summary"], "scoped-table-summary.json");
+    assertTrue(summary.detail === "summary" && summary.returned === 1 && summary.tables[0].index === 2, "summary scope mismatch");
+    assertTrue(summary.tables[0].cell_count === 8 && summary.tables[0].layout === "unverified", "summary guessed a verified layout");
+    assertTrue(summary.tables[0].fingerprint === null && summary.tables[0].inspection_complete === false, "summary exposed a mutation guard");
+    assertTrue(summary.tables[0].cells.length === 0 && summary.tables[0].linear_cells.length === 0, "summary returned cell contents");
+    assertTrue(fso.GetFile(fso.BuildPath(testDir, "scoped-table-summary.json")).Size < fso.GetFile(fso.BuildPath(testDir, "scoped-table-full.json")).Size, "summary did not reduce response size");
+    requireFailure(["tables", "--table", "2", "--max", "1"]);
+    requireFailure(["tables", "--table", "3"]);
+    assertTrue(String(queryDoc.Content.Text) === textBefore && Boolean(queryDoc.Saved) === savedBefore, "read-only inspection changed the document");
+    assertTrue(Number(word.Selection.Start) === selectionStart && Number(word.Selection.End) === selectionEnd, "read-only inspection changed the selection");
+    assertTrue(String(word.ActiveDocument.FullName).toLowerCase() === queryPath.toLowerCase(), "read-only inspection switched the active document");
+  } finally {
+    queryDoc.Close(false);
+    queryDoc = null;
+    doc.Activate();
+  }
+}
 
 function runFixture(path) {
+  var fixtureExtension = "." + fso.GetExtensionName(path);
   var sentinel = "WORD_CONTROL_FIXTURE_SENTINEL";
   var revisedSentinel = "WORD_CONTROL_FIXTURE_REVISED";
   var sentinelInput = fso.BuildPath(testDir, "fixture-sentinel.txt");
@@ -222,9 +296,15 @@ function runFixture(path) {
   word.ScreenUpdating = false;
   word.AutomationSecurity = 3; // msoAutomationSecurityForceDisable
   assertTrue(Number(word.AutomationSecurity) === 3, "could not force-disable document macros");
-  try { word.Options.UpdateLinksAtOpen = false; } catch (linkOptionError) {}
-  try { word.Options.CheckGrammarAsYouType = false; } catch (grammarOptionError) {}
-  try { word.Options.CheckSpellingAsYouType = false; } catch (spellingOptionError) {}
+  // These options persist across Word instances; restore them when the test exits.
+  var optionNames = ["UpdateLinksAtOpen", "CheckGrammarAsYouType", "CheckSpellingAsYouType"];
+  for (var o = 0; o < optionNames.length; o++) {
+    var optionName = optionNames[o];
+    try {
+      savedWordOptions[optionName] = word.Options[optionName];
+      word.Options[optionName] = false;
+    } catch (optionError) {}
+  }
 
   doc = word.Documents.Open(path, false, false, false);
   doc.Activate();
@@ -238,6 +318,7 @@ function runFixture(path) {
   var sectionCount = Number(doc.Sections.Count);
   var inlineShapeCount = Number(doc.InlineShapes.Count);
   var shapeCount = Number(doc.Shapes.Count);
+  var originalText = String(doc.Content.Text);
   var pageCount = 0;
   try { pageCount = Number(doc.ComputeStatistics(2)); } catch (pageError) {}
 
@@ -338,7 +419,7 @@ function runFixture(path) {
   ], "fixture-delete-equation.json");
   assertTrue(deletedEquation.ok && deletedEquation.remaining_equations === equationCount, "fixture equation cleanup failed");
 
-  var unsavedBackupPath = fso.BuildPath(testDir, "fixture-unsaved-copy.doc");
+  var unsavedBackupPath = fso.BuildPath(testDir, "fixture-unsaved-copy" + fixtureExtension);
   var unsavedBackupResult = execute([
     "save-copy", "--path", unsavedBackupPath, "--expect-path", path, "--yes"
   ]);
@@ -352,7 +433,7 @@ function runFixture(path) {
   }
 
   runJson(["save-active", "--expect-path", path, "--yes"], "fixture-save.json");
-  var savedBackupPath = fso.BuildPath(testDir, "fixture-saved-backup.doc");
+  var savedBackupPath = fso.BuildPath(testDir, "fixture-saved-backup" + fixtureExtension);
   var savedBackup = runJson([
     "save-copy", "--path", savedBackupPath, "--expect-path", path, "--yes"
   ], "fixture-saved-backup.json");
@@ -365,6 +446,16 @@ function runFixture(path) {
   assertTrue(pdf.ok && fso.FileExists(pdfPath), "fixture PDF export failed");
 
   runJson(["close-active", "--discard", "--expect-path", path, "--yes"], "fixture-close.json");
+  doc = null;
+
+  // Reopen the saved copy: a command receipt alone cannot prove persistence.
+  doc = word.Documents.Open(path, false, true, false);
+  assertTrue(String(doc.Range(0, insertionPosition).Text) === originalText.substring(0, originalText.length - 1), "fixture original body text changed after save/reopen");
+  assertTrue(Number(doc.Tables.Count) === tableCount && Number(doc.OMaths.Count) === equationCount, "fixture original object counts changed after save/reopen");
+  assertTrue(Number(doc.Sections.Count) === sectionCount, "fixture sections changed after save/reopen");
+  assertTrue(Number(doc.InlineShapes.Count) === inlineShapeCount && Number(doc.Shapes.Count) === shapeCount, "fixture images changed after save/reopen");
+  assertTrue(Number(doc.Comments.Count) === commentCount + 1 && Number(doc.Revisions.Count) > revisionCount, "fixture comments/revisions were not persisted");
+  doc.Close(false);
   doc = null;
 
   return "{"
@@ -384,6 +475,8 @@ function runFixture(path) {
     + "\"table_layout_warnings\":" + tableLayoutWarnings + ","
     + "\"table_read_errors\":" + tableReadErrors + ","
     + "\"advanced_table_operations\":true,"
+    + "\"original_content_preserved\":true,"
+    + "\"saved_readback\":true,"
     + "\"unsaved_backup_behavior\":" + '"' + unsavedBackupBehavior + '"'
     + "}";
 }
@@ -494,6 +587,8 @@ try {
   ], "delete-equation.json");
   assertTrue(deletedEquation.ok && deletedEquation.remaining_equations === 0, "guarded equation deletion failed");
 
+  exerciseScopedInspection();
+
   runJson(["save-active", "--expect-path", docPath, "--yes"], "save.json");
   var backupPath = fso.BuildPath(testDir, "command-integration.backup.docx");
   var backup = runJson([
@@ -518,6 +613,10 @@ try {
     doc = null;
   }
   if (word !== null) {
+    for (var optionName in savedWordOptions) {
+      try { word.Options[optionName] = savedWordOptions[optionName]; }
+      catch (restoreError) { if (failure === null) failure = restoreError; }
+    }
     try { word.Quit(0); } catch (quitError) {}
     word = null;
   }

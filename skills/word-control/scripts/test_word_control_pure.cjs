@@ -131,4 +131,174 @@ test('Output preflight rejects document paths, collisions, and unapproved overwr
   assert.equal(writes.at(-1).mode, 1, 'New outputs must use exclusive creation');
 });
 
+test('Paragraph pages preserve legacy output and read only the requested absolute indices', () => {
+  let allowed = [1, 80];
+  const visited = [];
+  const paragraphs = index => {
+    assert.ok(index >= allowed[0] && index <= allowed[1], 'Unrequested paragraph read');
+    visited.push(index);
+    return { Range: { Text: 'paragraph ' + index + '\r' } };
+  };
+  paragraphs.Count = 85;
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: { Paragraphs: paragraphs } });
+  let result;
+  context.emit = value => { result = JSON.parse(value); };
+  context.ARGS = ['paragraphs'];
+  context.commandParagraphs();
+  assert.equal(result.returned, 80);
+  assert.equal(result.paragraphs[79].index, 80);
+  assert.equal('next_from' in result, false, 'Legacy output shape must stay unchanged');
+
+  allowed = [1, 2]; visited.length = 0;
+  context.ARGS = ['paragraphs', '--max', '2'];
+  context.commandParagraphs();
+  assert.deepEqual(result, { ok: true, paragraph_count: 85, returned: 2,
+    paragraphs: [{ index: 1, text: 'paragraph 1\n' }, { index: 2, text: 'paragraph 2\n' }] });
+  assert.deepEqual(visited, [1, 2]);
+
+  allowed = [43, 44]; visited.length = 0;
+  context.ARGS = ['paragraphs', '--from', '43', '--max', '2'];
+  context.commandParagraphs();
+  assert.deepEqual(visited, [43, 44]);
+  assert.equal(result.from, 43);
+  assert.equal(result.next_from, 45);
+  assert.deepEqual(result.paragraphs.map(item => item.index), [43, 44]);
+  assert.equal(result.paragraphs[0].text, 'paragraph 43\n');
+
+  allowed = [85, 85]; visited.length = 0;
+  context.ARGS = ['paragraphs', '--from', '85', '--max', '5'];
+  context.commandParagraphs();
+  assert.equal(result.returned, 1);
+  assert.equal(result.next_from, null);
+  context.ARGS = ['paragraphs', '--from', '86'];
+  visited.length = 0;
+  context.commandParagraphs();
+  assert.equal(result.returned, 0);
+  assert.equal(result.next_from, null);
+  assert.deepEqual(visited, []);
+  for (const invalid of ['0', '-1', 'abc']) {
+    context.ARGS = ['paragraphs', '--from', invalid];
+    assert.throws(() => context.commandParagraphs(), /positive integer/);
+  }
+});
+
+test('Failed reads stay unknown and equation text/fingerprints share one snapshot', () => {
+  let result;
+  context.emit = value => { result = JSON.parse(value); };
+  const paragraphs = index => {
+    if (index === 2) throw new Error('Paragraph unavailable');
+    return { Range: { Text: index === 1 ? '\r' : 'readable\r' } };
+  };
+  paragraphs.Count = 3;
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: { Paragraphs: paragraphs } });
+  context.ARGS = ['paragraphs'];
+  context.commandParagraphs();
+  assert.equal(result.inspection_complete, false);
+  assert.equal(result.paragraphs[0].text, '\n');
+  assert.equal(result.paragraphs[1].text, null, 'Unreadable is distinct from empty');
+  assert.equal(result.paragraphs[2].text, 'readable\n');
+  assert.match(result.read_errors[0], /paragraph\[2\].*unavailable/);
+
+  const reads = [0, 0, 0];
+  const equations = index => ({ Range: { get Text() {
+    reads[index - 1]++;
+    if (index === 2) throw new Error('Equation unavailable');
+    return reads[index - 1] === 1 ? 'x\r' : 'changed';
+  } } });
+  equations.Count = 3;
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: { OMaths: equations } });
+  context.ARGS = ['equations'];
+  context.commandEquations();
+  assert.deepEqual(reads, [1, 1, 1], 'Read text exactly once per equation');
+  assert.equal(result.equations[0].text, 'x\n');
+  assert.equal(result.equations[0].fingerprint, context.textHash('x\n'));
+  assert.equal(result.equations[1].text, null);
+  assert.equal(result.equations[1].fingerprint, null);
+  assert.equal(result.equations[1].inspection_complete, false);
+  assert.match(result.equations[1].read_errors[0], /unavailable/);
+  assert.equal(result.equations[2].text, 'x\n');
+});
+
+test('Single-table inspection is bounded and read-only detail cannot supply mutation fingerprints', () => {
+  let summaryOnly = false;
+  let textOnly = false;
+  const border = { LineStyle: 1, LineWidth: 4, Color: 0 };
+  const makeTable = label => {
+    const items = Array.from({ length: 4 }, (_, index) => ({
+      get Range() { assert.equal(summaryOnly, false, 'Summary read a cell'); return { Text: label + index + '\r\x07' }; },
+      get Shading() { assert.equal(summaryOnly || textOnly, false, 'Read-only detail read shading'); return { BackgroundPatternColor: 0, Texture: 0 }; },
+      Borders() { assert.equal(summaryOnly || textOnly, false, 'Read-only detail read cell borders'); return border; },
+    }));
+    const cells = index => { assert.equal(summaryOnly, false, 'Summary enumerated cells'); return items[index - 1]; };
+    cells.Count = items.length;
+    return { Rows: { Count: 2 }, Columns: { Count: 2 },
+      Range: { Cells: cells, get Text() { assert.equal(summaryOnly, false, 'Summary read table text'); return label + '\r\x07'; } },
+      Cell: (row, column) => items[(row - 1) * 2 + column - 1],
+      Borders() { assert.equal(summaryOnly || textOnly, false, 'Read-only detail read table borders'); return border; } };
+  };
+  const items = ['first', 'second', 'third'].map(makeTable);
+  let allowed = [1, 2, 3];
+  const visited = [];
+  const tables = index => { assert.ok(allowed.includes(index), 'Unrequested table read'); visited.push(index); return items[index - 1]; };
+  tables.Count = items.length;
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: { Tables: tables } });
+  let result;
+  context.emit = value => { result = JSON.parse(value); };
+  context.ARGS = ['tables'];
+  context.commandTables();
+  const legacy = result;
+  assert.equal(legacy.returned, 3);
+  assert.equal('detail' in legacy, false);
+
+  allowed = [2]; visited.length = 0;
+  context.ARGS = ['tables', '--table', '2'];
+  context.commandTables();
+  assert.deepEqual(visited, [2]);
+  assert.equal(result.table_count, 3);
+  assert.equal(result.returned, 1);
+  assert.deepEqual(result.tables[0], legacy.tables[1]);
+
+  textOnly = true; visited.length = 0;
+  context.ARGS = ['tables', '--table', '2', '--detail', 'text'];
+  context.commandTables();
+  assert.deepEqual(visited, [2]);
+  assert.deepEqual(result.tables[0].cells, legacy.tables[1].cells);
+  assert.equal(result.tables[0].fingerprint, null);
+  assert.equal(result.tables[0].inspection_complete, false);
+  assert.deepEqual(result.tables[0].read_errors, []);
+  context.ARGS = ['set-cell', '--allow-unverified-target'];
+  assert.throws(() => context.requireFingerprint(result.tables[0].fingerprint, '--expect-table-fingerprint', '--allow-unverified-target'), /incomplete/);
+  textOnly = false;
+
+  summaryOnly = true; visited.length = 0;
+  context.ARGS = ['tables', '--table', '2', '--detail', 'summary'];
+  context.commandTables();
+  assert.deepEqual(visited, [2]);
+  assert.equal(result.detail, 'summary');
+  const brief = result.tables[0];
+  assert.equal(brief.index, 2);
+  assert.equal(brief.cell_count, 4);
+  assert.equal(brief.layout, 'unverified');
+  assert.equal(brief.inspection_complete, false);
+  assert.equal(brief.fingerprint, null);
+  assert.deepEqual(brief.cells, []);
+  assert.deepEqual(brief.read_errors, []);
+  context.ARGS = ['set-cell', '--allow-unverified-target'];
+  assert.throws(() => context.requireFingerprint(brief.fingerprint, '--expect-table-fingerprint', '--allow-unverified-target'), /incomplete/);
+
+  allowed = [1]; visited.length = 0;
+  context.ARGS = ['tables', '--max', '1', '--detail', 'summary'];
+  context.commandTables();
+  assert.deepEqual(visited, [1]);
+  for (const [args, message] of [
+    [['--table', '2', '--max', '1'], /--table.*--max/],
+    [['--table', '4'], /out of range/],
+    [['--table', '0'], /positive integer/],
+    [['--detail', 'brief'], /full, text or summary/],
+  ]) {
+    context.ARGS = ['tables', ...args];
+    assert.throws(() => context.commandTables(), message);
+  }
+});
+
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));

@@ -3,7 +3,7 @@
 Set the entry point once per PowerShell session:
 
 ```powershell
-$wc = "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js"
+$wc = "$env:USERPROFILE\.agents\skills\word-control\scripts\word_control.js"
 ```
 
 ## Inspect First
@@ -11,13 +11,29 @@ $wc = "$env:USERPROFILE\.codex\skills\word-control\scripts\word_control.js"
 ```powershell
 cscript //nologo $wc status --output status.json
 cscript //nologo $wc selection-info --output selection-info.json
-cscript //nologo $wc tables --max 25 --output tables.json
+cscript //nologo $wc tables --detail summary --output tables-summary.json
+cscript //nologo $wc tables --detail text --output tables-text.json
+cscript //nologo $wc tables --table 2 --output table-2.json
+cscript //nologo $wc paragraphs --from 81 --max 40 --output paragraphs-81.json
 cscript //nologo $wc equations --output equations.json
 ```
 
 Read-only commands are `help`, `status`, `selection`, `selection-info`, `document-text`, `paragraphs`, `tables`, `equations`, and `convert-equation`.
 
 Use the active document path returned by `status` as `<doc>`. For an unsaved document, use its exact name with `--expect-name` instead.
+
+### Scoped queries
+
+- `paragraphs --from N --max count` reads only the requested entries of Word's document paragraph collection. Indices are 1-based and remain absolute in the result. `--max` defaults to 80. With `--from`, the result adds `from` and `next_from`; `next_from:null` means the end. Starting beyond the end returns an empty page. These are live indices, not stable cursors across edits; refresh after document changes.
+- `tables --table N` reads only that table, in full detail by default. `table_count` remains the whole collection count and `returned` is 1. An out-of-range index fails. Do not combine `--table` and `--max`; existing `tables --max N` still reads the first N tables.
+- `tables --detail summary` reads table dimensions and cell counts without retrieving cell text, formatting or fingerprints. It works with `--table` or `--max`. Every summary uses `fingerprint:null`, `inspection_complete:false`, `layout:"unverified"`, and empty cell arrays. Unknown dimensions/counts remain null with warnings/read errors. Counts alone do not prove that a table is rectangular.
+- `tables --detail text` reads cell contents, including `linear_cells` for irregular/merged tables, without inspecting formatting. It works with `--table` or `--max`. It intentionally returns `fingerprint:null` and `inspection_complete:false`; check `read_errors` for missing text. Use it when reading table values is the task.
+- Use `tables --table N` or explicit `--detail full` before editing. Require a complete full inspection and its fingerprint; summary/text modes cannot authorize writes.
+
+Without the new options, successful paragraph/table limits, full-detail fields and output shapes are unchanged. Failed paragraph reads return `text:null`, with top-level `inspection_complete:false` and indexed `read_errors`; they are not empty paragraphs. Failed equation reads return `text:null`, `fingerprint:null`, `inspection_complete:false` and `read_errors` on that equation. Successful equation text and its fingerprint come from one read. Do not treat a partial response as complete document evidence; resolve the error and re-read the affected scope.
+
+Paragraph results do not provide selection mutation guards. For writing, read the [editing workflow](workflow.md) and obtain the appropriate fresh selection or object inspection.
+
 
 ## Back Up
 
@@ -43,9 +59,11 @@ Snapshots now require `story_type` as well as the three older selection values; 
 
 Selection changes invalidate the snapshot. Inspect again before a second change. A collapsed selection is rejected unless insertion is deliberate and `--allow-insert` is also supplied.
 
+Comments and tracked changes can be created or toggled, but a full review-history report is not supported.
+
 ## Tables
 
-Use the target fingerprint from a fresh `tables` result:
+Use the target fingerprint from a fresh full `tables --table N` result:
 
 ```powershell
 cscript //nologo $wc create-table --rows 3 --cols 3 --input table.tsv --at end --expect-path "<doc>" --yes
@@ -94,7 +112,9 @@ cscript //nologo $wc set-equation --index 1 --expect-equation-fingerprint <hash>
 cscript //nologo $wc delete-equation --index 1 --expect-equation-fingerprint <hash> --expect-path "<doc>" --yes
 ```
 
-Unknown LaTeX commands are rejected. Use `--format linear` only after checking Word linear syntax.
+The conservative LaTeX converter supports common fractions, square roots, integrals, sums, products, superscripts, subscripts, comparisons and Greek letters. Unknown commands, complex environments such as `align`, `matrix`, `cases`, and custom macros are unsupported. Use `--format linear` only after checking Word linear syntax.
+
+Verify the resulting OMath object after insertion or replacement. When layout matters, export a PDF for visual review.
 
 ## Save, Export, and Close
 
@@ -108,18 +128,12 @@ Use exactly one of `--save` or `--discard` with `close-active`. It closes only t
 
 ## Troubleshooting
 
-- `no running Word instance found`: open the document in desktop Word.
-- `active document path mismatch`: bring the intended document to the front and rerun `status`.
-- `selection ... changed`: rerun `selection-info`; do not reuse old coordinates or hashes.
-- `target fingerprint changed`: rerun `tables` or `equations`; indexes alone are not stable identifiers.
-- `selection is collapsed`: select text, or explicitly approve cursor insertion.
-- Word dialog blocks automation: resolve the visible dialog manually, then rerun inspection.
-- Non-ASCII console text is corrupted: use UTF-8 input files and `--output` files.
+See [Recovery](recovery.md) for stale targets, incomplete inspections and blocked Word automation.
 
 ## Cleanup
 
-Delete only task-generated status, selection, table, equation, conversion, and input scratch files after verification. Keep the original DOCX, explicit backups, requested PDF/PNG previews, and anything needed for rollback or audit.
+Follow [task-artifact cleanup](recovery.md#cleanup); preserve source documents, backups and requested review outputs.
 
 ## Maintenance
 
-The `.codex` installation is the source of truth. Back up all installations, edit and fully test `.codex`, then copy its files to `.agents` and `.grok` and compare SHA-256 hashes. The copied command examples intentionally continue to target the canonical `.codex` entry point. Do not synchronize after failed or skipped integration tests.
+See [Maintenance and validation](maintenance.md) for the canonical source, isolated tests and verified synchronization.

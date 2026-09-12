@@ -730,8 +730,8 @@ function commandHelp() {
     "  selection [--output file]",
     "  selection-info [--output file]",
     "  document-text [--max chars|--full] [--output file]",
-    "  paragraphs [--max count] [--output file]",
-    "  tables [--max count] [--output file]",
+    "  paragraphs [--from index] [--max count] [--output file]",
+    "  tables [--table index|--max count] [--detail full|text|summary] [--output file]",
     "  equations [--output file]",
     "  convert-equation --input file [--format latex|linear|word] [--output file]",
     "  enable-track-changes --expect-path file --yes",
@@ -821,28 +821,42 @@ function commandDocumentText() {
 function commandParagraphs() {
   var word = getWord();
   var doc = getActiveDocument(word);
+  var from = parsePositiveInt(opt("--from", "1"), "--from");
+  if (!isFinite(from)) die("--from must be a finite positive integer");
   var max = parsePositiveInt(opt("--max", "80"), "--max");
-  var count = Number(doc.Paragraphs.Count);
-  if (max > count) max = count;
+  var paragraphs = doc.Paragraphs;
+  var count = Number(paragraphs.Count);
+  max = Math.min(max, Math.max(0, count - from + 1));
   var parts = [];
-  for (var i = 1; i <= max; i++) {
-    var text = "";
-    try { text = normalizeText(doc.Paragraphs(i).Range.Text); } catch (e) {}
-    parts.push("{\"index\":" + i + ",\"text\":" + q(text) + "}");
+  var readErrors = [];
+  for (var i = from; i < from + max; i++) {
+    var textJson = "null";
+    try { textJson = q(normalizeText(paragraphs(i).Range.Text)); }
+    catch (e) { readErrors.push("paragraph[" + i + "]:" + (e.message || String(e))); }
+    parts.push("{\"index\":" + i + ",\"text\":" + textJson + "}");
   }
-  emit("{\"ok\":true,\"paragraph_count\":" + count + ",\"returned\":" + max + ",\"paragraphs\":[" + parts.join(",") + "]}");
+  var page = hasFlag("--from") ? ",\"from\":" + from + ",\"next_from\":" + (max > 0 && from + max <= count ? from + max : "null") : "";
+  var incomplete = readErrors.length ? ",\"inspection_complete\":false,\"read_errors\":" + stringArrayJson(readErrors) : "";
+  emit("{\"ok\":true,\"paragraph_count\":" + count + ",\"returned\":" + max + page + incomplete + ",\"paragraphs\":[" + parts.join(",") + "]}");
 }
 
 function commandTables() {
+  var tableText = opt("--table", "");
+  var maxText = opt("--max", "");
+  if (tableText && maxText) die("use either --table or --max, not both");
+  var detail = opt("--detail", "full");
+  if (detail !== "full" && detail !== "text" && detail !== "summary") die("--detail must be full, text or summary");
+  var first = tableText ? parsePositiveInt(tableText, "--table") : 1;
   var word = getWord();
   var doc = getActiveDocument(word);
-  var count = Number(doc.Tables.Count);
-  var maxText = opt("--max", "");
-  var returned = maxText ? parsePositiveInt(maxText, "--max") : count;
+  var tables = doc.Tables;
+  var count = Number(tables.Count);
+  if (tableText && first > count) die("table index out of range; document has " + count + " tables");
+  var returned = tableText ? 1 : (maxText ? parsePositiveInt(maxText, "--max") : count);
   if (returned > count) returned = count;
   var parts = [];
-  for (var i = 1; i <= returned; i++) {
-    var table = doc.Tables(i);
+  for (var i = first; i < first + returned; i++) {
+    var table = tables(i);
     var rowCount = 0;
     var colCount = 0;
     var rowCountKnown = true;
@@ -851,6 +865,19 @@ function commandTables() {
     var readErrors = [];
     try { rowCount = Number(table.Rows.Count); } catch (e1) { rowCountKnown = false; layoutWarnings.push("rows:" + (e1.message || String(e1))); }
     try { colCount = Number(table.Columns.Count); } catch (e2) { colCountKnown = false; layoutWarnings.push("columns:" + (e2.message || String(e2))); }
+    var tableInfo = "{\"index\":" + i + ",\"rows\":" + (rowCountKnown ? rowCount : "null") + ",\"cols\":" + (colCountKnown ? colCount : "null");
+    if (detail === "summary") {
+      var summaryCellCount = "null";
+      try { summaryCellCount = String(Number(table.Range.Cells.Count)); }
+      catch (summaryError) { readErrors.push("cell-count:" + (summaryError.message || String(summaryError))); }
+      // Counts alone cannot establish a rectangular layout or a safe write target.
+      parts.push(tableInfo + ",\"layout\":\"unverified\",\"cell_count\":" + summaryCellCount
+        + ",\"fingerprint\":null,\"inspection_complete\":false"
+        + ",\"layout_warnings\":" + stringArrayJson(layoutWarnings)
+        + ",\"read_errors\":" + stringArrayJson(readErrors)
+        + ",\"cells\":[],\"linear_cells\":[]}");
+      continue;
+    }
     var cells = [];
     var linearCells = [];
     var cellCount = 0;
@@ -894,30 +921,39 @@ function commandTables() {
         readErrors.push("linear-cell-enumeration:" + (e7.message || String(e7)));
       }
     }
-    var fingerprint = tableFingerprint(table, readErrors);
-    parts.push("{\"index\":" + i + ",\"rows\":" + (rowCountKnown ? rowCount : "null") + ",\"cols\":" + (colCountKnown ? colCount : "null")
+    // Text-only inspection never supplies a guard; mutations still need full formatting reads.
+    var fingerprint = detail === "full" ? tableFingerprint(table, readErrors) : null;
+    parts.push(tableInfo
       + ",\"layout\":" + q(rectangular ? "rectangular" : "irregular")
       + ",\"cell_count\":" + cellCount
       + ",\"fingerprint\":" + (fingerprint === null ? "null" : q(fingerprint))
-      + ",\"inspection_complete\":" + boolJson(readErrors.length === 0)
+      + ",\"inspection_complete\":" + boolJson(detail === "full" && readErrors.length === 0)
       + ",\"layout_warnings\":" + stringArrayJson(layoutWarnings)
       + ",\"read_errors\":" + stringArrayJson(readErrors)
       + ",\"cells\":[" + cells.join(",") + "]"
       + ",\"linear_cells\":[" + linearCells.join(",") + "]}");
   }
-  emit("{\"ok\":true,\"table_count\":" + count + ",\"returned\":" + returned + ",\"tables\":[" + parts.join(",") + "]}");
+  var detailPart = hasFlag("--detail") ? ",\"detail\":" + q(detail) : "";
+  emit("{\"ok\":true,\"table_count\":" + count + ",\"returned\":" + returned + detailPart + ",\"tables\":[" + parts.join(",") + "]}");
 }
 
 function commandEquations() {
   var word = getWord();
   var doc = getActiveDocument(word);
-  var count = Number(doc.OMaths.Count);
+  var equations = doc.OMaths;
+  var count = Number(equations.Count);
   var parts = [];
   for (var i = 1; i <= count; i++) {
-    var text = "";
-    try { text = normalizeText(doc.OMaths(i).Range.Text); } catch (e) {}
-    parts.push("{\"index\":" + i + ",\"text\":" + q(text)
-      + ",\"fingerprint\":" + q(equationFingerprint(doc.OMaths(i))) + "}");
+    var text = null;
+    var fingerprint = null;
+    var readErrors = [];
+    try {
+      text = normalizeText(equations(i).Range.Text);
+      fingerprint = textHash(text);
+    } catch (e) { readErrors.push("equation[" + i + "]:" + (e.message || String(e))); }
+    var incomplete = readErrors.length ? ",\"inspection_complete\":false,\"read_errors\":" + stringArrayJson(readErrors) : "";
+    parts.push("{\"index\":" + i + ",\"text\":" + (text === null ? "null" : q(text))
+      + ",\"fingerprint\":" + (fingerprint === null ? "null" : q(fingerprint)) + incomplete + "}");
   }
   emit("{\"ok\":true,\"equation_count\":" + count + ",\"equations\":[" + parts.join(",") + "]}");
 }

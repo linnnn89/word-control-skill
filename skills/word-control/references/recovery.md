@@ -1,0 +1,21 @@
+# Recovery and cleanup
+
+- `no running Word instance found`: open the intended document in desktop Word.
+- `active document path mismatch`: bring the intended document to the front and rerun `status`.
+- `selection ... changed`: rerun `selection-info`; use story type, start, end and hash from the same result.
+- `target fingerprint changed`: inspect that table with `tables --table N` or rerun `equations`. An index alone is not an identity guarantee.
+- `table index out of range`: refresh `tables --detail summary` before selecting an index; document edits can change indices.
+- `--table` with `--max`: choose either a single table or a prefix of the collection.
+- Summary/text mode has no fingerprint: request full detail for the specific table. This is an intentional omission, not a failed COM read.
+- Paragraph/equation has `text:null` and `read_errors`: the read failed; keep that content unknown and re-read the affected scope after resolving the error. An `ok:true` envelope can contain partial inspection results.
+- Full inspection has `fingerprint:null`, `inspection_complete:false` or `read_errors`: do not mutate from that result. Resolve the read failure and inspect again.
+- Merged table has unknown row/column counts: inspect full `linear_cells` and use `set-cell --cell`. Do not force structural row/column operations on an irregular table.
+- `selection is collapsed`: select the intended text; use `--allow-insert` only for intended cursor insertion.
+- Backup fails with unsaved changes: do not silently save or use an older disk copy. Obtain the user's decision unless the existing request already authorizes the necessary action.
+- Word dialog blocks automation: have the visible dialog resolved; do not dismiss it or close the user's session automatically.
+- Non-ASCII console text is corrupted: use UTF-8 input and `--output` files.
+- Missing response or nonzero exit: inspect the current target before retrying. A failure after writing may leave changed content; report any `failures` or rollback failures. This bridge has no durable operation receipts.
+
+## Cleanup
+
+Delete only task-generated status, selection, table, equation, conversion and input scratch files after verification. Keep original DOCX files, explicit backups, requested PDF/PNG previews and anything needed for rollback or audit. Never quit the user's Word application.
