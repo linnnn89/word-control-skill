@@ -17,7 +17,7 @@
 - Full inspection has `fingerprint:null`, `inspection_complete:false` or `read_errors`: do not mutate from that result. Resolve the read failure and inspect again.
 - Merged table has unknown row/column counts: inspect full `linear_cells` and use `set-cell --cell`. Do not force structural row/column operations on an irregular table.
 - `selection is collapsed`: select the intended text; use `--allow-insert` only for intended cursor insertion.
-- Backup fails with unsaved changes: do not silently save or use an older disk copy. Obtain the user's decision unless the existing request already authorizes the necessary action.
+- Backup fails or cannot include unsaved changes: stop dependent edits, preserve the open document, and follow the [backup policy](workflow.md#backup-before-editing) for an already authorized save or an explicit waiver. Do not silently save or use an older disk copy.
 - Save is cancelled, pending or cannot be confirmed: leave the document open, inspect Word's save state and resolve the cause before retrying. Never follow a failed save with `close-active --discard` to finish a save request.
 - Backup/PDF publication or restoration fails: inspect the final path and any reported `previous.<extension>` recovery file. Preserve the old content and resolve the file lock or access error before restoring; never overwrite a concurrent output blindly. After interruption, check the destination's `.word-control-*.tmp` directories before retrying.
 - Output reports `cleanup_warning`: publication succeeded but temporary/recovery files remain at the reported path. Verify the final output before removing those files; the warning is not a request to regenerate the output.

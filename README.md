@@ -1,136 +1,137 @@
 # Word Control Skill
 
-## English
+Word Control is a Codex skill for narrow, in-place editing of the active Microsoft Word desktop document on Windows, using local Word COM automation.
 
-Word Control is a Codex skill for narrow, in-place editing of the active Microsoft Word desktop document on Windows. It uses local Word COM automation so an agent can inspect and edit the document already open in Word instead of regenerating a DOCX.
+它直接检查和修改 Word 中已经打开的文档，支持文字、批注、修订、表格、公式、备份和 PDF 导出。首次修改用户文档前，AI 应按操作手册建立可核对的备份；每次写入仍需核对文档身份和最新的选区或对象指纹，并检查修改影响范围内的前后差异。
 
-Typical tasks include:
+## 运行条件
 
-- inspect the active document and selection, find literal text in the main story or notes, and read paragraph/cell pages or targeted tables/equations;
-- replace selected text, add comments, and make tracked changes;
-- edit table cells, swap cell contents, add or remove rows and columns, and change borders or shading;
-- insert, replace, and remove Word equations from supported LaTeX or linear input;
-- create a protected copy, save the active document, or export a PDF.
+- Windows、桌面版 Microsoft Word、Windows Script Host（`cscript.exe`）。
+- 以下安装命令使用 PowerShell；Git 用于克隆仓库，也可以下载 ZIP。
+- 只有运行完整测试套件才需要 Node.js；日常 Word 操作不依赖 Node.js。
 
-The skill is intentionally conservative. Mutations require explicit confirmation plus a fresh document path and, where applicable, a selection hash or table/equation fingerprint. Existing backups and exports are not overwritten by default, and closing a document never quits the user's Word application.
+这是本地 Word COM 技能，不支持 Word Online。
 
-## 中文
+## 安装 Skill
 
-Word Control 是一个面向 Windows 桌面版 Microsoft Word 的 Codex 技能。它通过本地 Word 自动化，对当前已经打开的文档进行小范围、原位修改，避免为了简单编辑而重新生成整个 DOCX 文件。
-
-主要能力包括：
-
-- 检查当前文档和选区，定位正文、脚注或尾注中的文字，按需读取段落、单元格分页及指定表格或公式；
-- 替换选中文字、添加批注和使用修订模式修改；
-- 精细修改表格单元格，交换内容，增删行列，更改边框和底色；
-- 根据受支持的 LaTeX 或线性输入插入、替换和删除 Word 内置公式；
-- 创建保护性副本、保存当前文档或导出 PDF。
-
-本技能默认采用保守的安全策略。写操作除了明确确认外，还需要核对当前文档路径；选区、表格和公式操作还会校验刚刚取得的哈希或指纹。已有备份和导出文件默认不会被覆盖，关闭文档也不会退出用户正在使用的 Word。
-
-保存操作会等待后台保存队列完成，并检查 Word 的保存状态和文件是否非空；取消、超时或无法确认时会报错并保留打开的文档。备份与 PDF 先写入目标目录旁的临时目录，生成成功后才替换已有文件；替换失败尝试恢复旧文件，恢复受阻则保留并报告恢复路径。PDF 必须使用独立的 `.pdf` 路径。这些检查不替代内容重读，也不保证断电或进程终止时的原子提交。
-
-## Requirements
-
-- Windows
-- Microsoft Word desktop
-- Windows Script Host (`cscript.exe`)
-- PowerShell and Node.js for the test suite (ordinary Word commands do not require Node.js)
-
-This is not an Office.js add-in and does not control Word Online.
-
-## Repository Layout
+本项目使用以下位置作为唯一的用户全局安装：
 
 ```text
-skills/word-control/
-|-- SKILL.md
-|-- agents/openai.yaml
-|-- references/
-|   |-- workflow.md
-|   |-- usage.md
-|   |-- recovery.md
-|   `-- maintenance.md
-`-- scripts/
-    |-- word_control.js
-    |-- test_word_control.ps1
-    |-- test_word_control_integration.js
-    |-- test_word_control_pure.cjs
-    `-- test_word_control_save_outputs.ps1
+%USERPROFILE%\.agents\skills\word-control\SKILL.md
 ```
 
-## Installation
+只安装仓库中的 **`skills/word-control` 整个目录**，其中包含入口、手册、脚本和界面提示。仓库本身可以放在任意源码目录。不要额外在 `.codex/skills`、`.grok/skills` 或项目的 `.agents/skills` 中安装同名副本或链接；旧版备份也应放在技能发现目录之外。Codex 会读取用户目录下的 `.agents/skills`，同名技能可能同时出现在选择器中。[官方技能文档](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)
 
-Use `.agents/skills/word-control` as the only global installation. Keep backups outside skill discovery directories and avoid installing another global copy.
+### 1. 获取仓库
 
-Copy `skills/word-control` into the global skills directory:
+在准备存放源码的目录打开 PowerShell，执行：
 
 ```powershell
-Copy-Item -Recurse -Force ".\skills\word-control" "$env:USERPROFILE\.agents\skills\word-control"
+git clone https://github.com/linnnn89/word-control-skill.git
+if ($LASTEXITCODE -ne 0) { throw 'Clone failed; check the destination and Git output.' }
+Set-Location -LiteralPath '.\word-control-skill'
 ```
 
-Restart or refresh Codex so it discovers the installed skill.
+也可以在 [GitHub 仓库](https://github.com/linnnn89/word-control-skill) 点击 **Code → Download ZIP**，解压后在含有 `README.md` 和 `skills` 的仓库根目录打开 PowerShell。已有源码时直接使用该目录；升级前先核对本地修改和准备安装的版本。
 
-## Basic Use
+### 2. 首次安装
+
+在仓库根目录执行。下面的命令遇到已有安装会停止，请改按后面的升级步骤处理。
 
 ```powershell
-$wc = "$env:USERPROFILE\.agents\skills\word-control\scripts\word_control.js"
-cscript //nologo $wc status --output status.json
-cscript //nologo $wc selection-info --output selection-info.json
-cscript //nologo $wc tables --detail summary --output tables-summary.json
-cscript //nologo $wc tables --detail text --output tables-text.json
-cscript //nologo $wc tables --table 2 --output table-2.json
-cscript //nologo $wc paragraphs --from 81 --max 40 --output paragraphs-81.json
-cscript //nologo $wc find-text --input query.txt --max 5 --output matches.json
-cscript //nologo $wc tables --table 2 --detail text --cell-from 5 --cell-max 10 --output cells.json
-cscript //nologo $wc equations --index 1 --output equation-1.json
+$ErrorActionPreference = 'Stop'
+$source = (Resolve-Path -LiteralPath '.\skills\word-control').Path
+$skillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
+$destination = Join-Path $skillsRoot 'word-control'
+if (-not (Test-Path -LiteralPath (Join-Path $source 'SKILL.md') -PathType Leaf)) {
+    throw 'The source must be the complete skills/word-control directory.'
+}
+if (Test-Path -LiteralPath $destination) {
+    throw 'word-control is already installed. Follow the upgrade steps first.'
+}
+New-Item -ItemType Directory -Path $skillsRoot -Force | Out-Null
+Copy-Item -LiteralPath $source -Destination $destination -Recurse
 ```
 
-Choose a table index from the current summary; `2` above is an example. `--table N` inspects only that table and cannot be combined with `--max`. Full detail remains the default. Summary mode reads dimensions and cell counts without reading cell text or formatting; it deliberately returns a null fingerprint, `inspection_complete:false` and an unverified layout. Obtain a full inspection of the target before editing.
+### 3. 校验并使用
 
-Use `--detail text` to read table values without the expensive format fingerprint pass. It preserves regular and merged-cell text output, with `fingerprint:null` and `inspection_complete:false`. Summary and text modes cannot authorize mutations; use full detail for that step.
-
-Cell pagination requires a single table and text detail. It returns absolute linear cell indices, the table's whole cell count and `next_cell`; it does not assume a rectangular layout. `find-text` searches case-sensitive literal input from a UTF-8 file without a trailing newline. Choose `--story main`, `footnotes` or `endnotes`, and use bounded `--max`/`--context` plus `next_from` to continue. Results identify the searched story; they do not claim header/footer/text-box coverage or provide mutation guards. Search preserves the selection and the Find settings it changes. See the command guide for limits and partial-failure semantics.
-
-`set-cell` now verifies actual cell text and returns `applied`, `verified`, `readback`, document identity and a full post-write fingerprint. A verified result can supply the next operation's expected fingerprint without an extra full query; the next write still compares it against a newly computed live fingerprint. A failed write/verification returns a nonzero exit and no reusable fingerprint, distinguishing completed-but-unverified writes from unknown effects. Inspect before retrying.
-
-Table creation and border commands also preserve operation state when a later check fails. `create-table` reports whether a table was created and whether TSV filling completed; verified success checks its dimensions, supplied text and full fingerprint. Border commands retain write and rollback failures alongside final-inspection errors. Failed results have `verified:false` and `fingerprint:null`, even if part of the operation succeeded. Inspect before retrying; these results do not promise automatic rollback or replay. Other mutation commands keep their existing result contracts.
-
-Verified `set-table-borders`, `set-cell-borders` and `normalize-table-borders` results can also supply the next expected fingerprint on the same table. Require matching document/target identity, complete verification and empty error/failure arrays. This removes a redundant full query while retaining the next write's live check. After table creation, identify the new table separately; `table_count` does not identify its index.
-
-For maintenance experiments, `tables --table N --compare-xml` adds a bounded XML comparison alongside the existing full inspection. It reports whether two normalized snapshots match, a versioned candidate hash and diagnostic timing; it does not emit XML or replace the ordinary fingerprint. `xml-v1:` candidates are explicitly rejected by mutation guards. The option requires one table, full detail and MSXML 6.0; failures return nonzero exit and no reusable fingerprint. See the [command guide](skills/word-control/references/usage.md#experimental-xml-comparison) for limits. This diagnostic still runs the full inspection and does not accelerate writes.
-
-Paragraph indices are 1-based. `--from N --max count` returns the requested page with absolute indices and `next_from` (null at the end). Starting beyond the end returns no paragraphs. Document edits can shift indices. Successful calls without the new options retain their defaults and output shapes. Failed paragraph/equation reads are marked with null text and explicit read errors; an incomplete response must not be treated as complete document evidence. Equation text and its fingerprint use one snapshot.
-
-Before changing content, read [the editing workflow](skills/word-control/references/workflow.md), use the active document path returned by `status`, and obtain fresh selection or full object guards. The short [Skill entry](skills/word-control/SKILL.md) routes to the [command guide](skills/word-control/references/usage.md), [recovery guide](skills/word-control/references/recovery.md) and [maintenance guide](skills/word-control/references/maintenance.md) as needed.
-
-## Guard compatibility
-
-Selection mutations now require `--expect-story-type` from a fresh `selection-info` result, alongside start, end, and text hash. Saved documents require `--expect-path`; filename-only verification is reserved for unsaved documents.
-
-Scratch `--output` files must use `.json`, `.txt`, `.tsv`, or `.log`, must differ from input/document/export paths, and need explicit `--overwrite` to replace an existing file. Incomplete table inspection returns a null fingerprint and must not be used for mutation.
-
-## Validation
-
-The test runs pure regression checks, creates a separate hidden Word instance and temporary DOCX, exercises text, table, equation, save-copy, and PDF operations, and validates every JSON output with a strict parser. Scoped-query tests cover paragraph pages, regular and merged tables, summary guard omission, and unchanged document/selection state. It removes its own artifacts. If Word is already running, command integration is skipped; a skipped result is not a complete validation.
-
-XML acceptance uses independent before/after COM reads of story text, object counts, bookmarks and table formatting, together with selection/save state. Border acceptance checks non-border state and boundaries outside the target and its shared neighbors. These tests cover the exercised scope; a stable XML snapshot does not establish complete document or effective-formatting equivalence. Upstream risk references and scope requirements are recorded in the maintenance guide.
-
-Save/output acceptance includes native Word save cancellation without macros, exclusive locks on existing backup/PDF files, independent source-state and byte checks, and save/close/reopen, including an edit introduced during the close event. Fault-injection regressions also cover a Save call returning with unsaved state, pending/unreadable state, failed generation, publication and restoration, and destination races. Recovery files are preserved when restoration fails. See the [save/export guide](skills/word-control/references/usage.md#save-export-and-close) for failure and interruption semantics.
+继续在同一个 PowerShell 窗口执行，逐文件核对 SHA-256，再运行不连接 Word 的帮助命令：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\skills\word-control\scripts\test_word_control.ps1"
+$sourceFiles = @(Get-ChildItem -LiteralPath $source -File -Recurse)
+$installedFiles = @(Get-ChildItem -LiteralPath $destination -File -Recurse)
+if ($sourceFiles.Count -ne $installedFiles.Count) { throw 'Installed file count differs.' }
+foreach ($file in $sourceFiles) {
+    $relative = $file.FullName.Substring($source.Length + 1)
+    $installedFile = Join-Path $destination $relative
+    if ((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $installedFile -Algorithm SHA256).Hash) {
+        throw "Installed file differs: $relative"
+    }
+}
+cscript //nologo (Join-Path $destination 'scripts\word_control.js') help
+if ($LASTEXITCODE -ne 0) { throw 'Skill help failed.' }
+Write-Output "Installed and verified: $destination"
 ```
 
-Do not run document automation tests against an irreplaceable source file. Use a copy and a separate temporary output directory.
+确认 `SKILL.md` 直接位于 `word-control` 下，没有多嵌套一层同名文件夹。以上检查验证安装文件和命令入口，真实 Word 编辑的验收见[维护手册](skills/word-control/references/maintenance.md)。
 
-For a local paper, pass `-FixturePath` to the same test command. The test copies the source, verifies its SHA-256 remains unchanged, exercises guarded edits on appended test content, exports a PDF, and reopens the saved copy to verify the original body text and object counts. It restores the Word options it changes. The repository ignores `/测试用WORD/`, including its contents; keep private fixtures there. Fixture test artifacts are removed on completion, so preserve separate review outputs when visual comparison is needed.
+Codex 会自动发现新安装或更新的技能；在后续消息中输入 `$word-control` 使用。如果仍未出现，重启 Codex 后再试。[官方安装说明](https://learn.chatgpt.com/docs/build-skills#install-curated-skills-for-local-use)
 
-## Limitations
+例如，在桌面 Word 中打开需要处理的文档，然后对 Codex 说：
 
-- Intended for narrow edits, not whole-document reconstruction.
-- Complex LaTeX environments and custom macros require manual conversion and visual verification.
-- Merged or irregular tables have restricted structural editing support.
-- Visible Word dialogs can block automation and must be resolved manually.
+> 使用 $word-control，先确认当前文档并读取操作手册，按手册备份后，把我选中的文字修改为……，核对受影响范围内的前后差异。
+
+### 已有安装：升级和恢复
+
+先比较现有安装和准备安装的版本。有本地定制时，先保留并合并这些修改；维护本项目的规范副本时，遵循[维护手册](skills/word-control/references/maintenance.md)，不要用较旧的下载版本覆盖本地开发成果。
+
+确定要替换后，在没有任务正在使用该技能时，把旧安装整体移到技能发现目录之外。以下命令保留旧文件，并拒绝复用已有备份路径：
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$installedSkill = Join-Path $env:USERPROFILE '.agents\skills\word-control'
+$backupRoot = Join-Path $env:USERPROFILE '.agents\skill-backups'
+$backup = Join-Path $backupRoot ('word-control-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+if (-not (Test-Path -LiteralPath $installedSkill -PathType Container)) { throw 'No installed skill to back up.' }
+if (Test-Path -LiteralPath $backup) { throw 'Backup path already exists.' }
+New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+Move-Item -LiteralPath $installedSkill -Destination $backup
+Write-Output "Previous installation preserved at: $backup"
+```
+
+然后在准备安装的仓库根目录重复“首次安装”和“校验并使用”。若新安装失败，保留备份，将失败的新目录移出技能发现目录，再把旧目录移回原安装路径。校验通过前不要删除旧版，也不要把备份命名为另一个位于 `skills` 下的目录。
+
+### 给 AI 的安装指令
+
+可以直接把下面这段话连同本 README 交给具备本地文件和命令权限的 AI：
+
+> 请从 https://github.com/linnnn89/word-control-skill 获取源码，按 README 将 skills/word-control 完整安装到当前 Windows 用户的 %USERPROFILE%\.agents\skills\word-control，仅保留这一处全局安装。先检查已有安装和本地修改；升级时把旧目录保存在技能发现目录之外，再安装并逐文件校验 SHA-256。不要覆盖未处理的本地定制或自动删除其他已有副本。运行 cscript 的 help 验证入口，报告实际安装路径、校验结果及尚存的重复安装；安装后读取 SKILL.md，并按任务只读相关操作手册。
+
+如果 AI 使用已有的 `skill-installer`，仓库参数为 `linnnn89/word-control-skill`，子目录参数为 `skills/word-control`，并须显式把 `--dest` 指向 `%USERPROFILE%\.agents\skills` 这个**父目录**。在 PowerShell 中用 `"$env:USERPROFILE\.agents\skills"` 展开路径；不要沿用安装器的其他默认目录。已有安装仍按上述升级流程处理。
+
+## 入口与操作手册
+
+安装后从简短的 [SKILL.md](skills/word-control/SKILL.md) 进入，按任务加载所需手册。README 负责安装和上手，具体命令与编辑规则以手册为准。
+
+| 任务 | 读取位置 |
+| --- | --- |
+| 修改前备份、编辑顺序、验收与医学稿件格式边界 | [操作流程](skills/word-control/references/workflow.md) |
+| 查询范围、命令参数、表格/公式操作、保存与导出 | [命令手册](skills/word-control/references/usage.md) |
+| 目标已变化、备份或保存失败、部分结果与清理 | [故障恢复](skills/word-control/references/recovery.md) |
+| 修改技能、测试、同步与性能实验 | [维护手册](skills/word-control/references/maintenance.md) |
+
+备份要求由 AI 按工作流执行，命令本身没有自动备份门禁。连续修改同一文档可复用本次任务的有效基线备份；失败处理、明确豁免和核对要求见[备份规则](skills/word-control/references/workflow.md#backup-before-editing)。
+
+维护测试可使用 `/测试用WORD/` 中的本地论文；该目录及内容已加入 Git ignore。通过 `-FixturePath` 指定后，测试会使用副本并核对源文件哈希，详见维护手册。
+
+## 能力边界
+
+- 适合小范围编辑；新建文档或整体重建不在本技能范围内。
+- 复杂 LaTeX 环境和自定义宏需要人工转换及视觉核对。
+- 合并或不规则表格的结构编辑受限。
+- Word 对话框可能阻塞自动化，需要用户处理。
+- 保存和导出成功仍需按影响范围核对内容；文件恢复机制不保证断电或进程终止时的原子提交。
 
 ## License
 

@@ -57,13 +57,13 @@ This option requires full detail and one `--table`; it cannot be combined with c
 
 ## Back Up
 
-Choose a new path; do not overwrite an existing backup by default.
+Follow the workflow's [backup policy](workflow.md#backup-before-editing) before editing. Choose a new path with the source document's extension; `<backup.docx>` below assumes a DOCX source.
 
 ```powershell
 cscript //nologo $wc save-copy --path "<backup.docx>" --expect-path "<doc>" --yes
 ```
 
-If Word cannot create a copy while the source has unsaved changes, the command fails rather than copying an older on-disk version. Do not silently save the source; obtain approval first.
+If Word cannot create a copy while the source has unsaved changes, the command fails rather than copying an older on-disk version. Apply the workflow's verification and failure rules before continuing.
 
 ## Selection Changes
 

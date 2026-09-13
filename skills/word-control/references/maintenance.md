@@ -2,6 +2,8 @@
 
 Use `.agents/skills/word-control` as the sole global installation and maintenance source for this setup. Keep backups outside skill discovery directories. Edit and validate this installation, then synchronize the repository copy and compare every file by SHA-256. Do not recreate additional global copies or discovery links under other skill directories. Keep machine-local maintenance history in the backup, outside the distributed manuals.
 
+For documentation or UI-prompt changes only, validate the Skill frontmatter, `agents/openai.yaml`, relative links and command examples; exercise changed installation instructions in an isolated directory. Confirm runtime and test scripts are unchanged before synchronizing. The Word integration requirement below applies when runtime or test scripts change.
+
 Ordinary commands use Windows Script Host (`cscript`), not Node.js. Tests require Windows desktop Word, PowerShell and Node.js.
 
 The save/output regression uses a C# COM event sink compiled by Windows PowerShell to cancel Word's `DocumentBeforeSave` event without macros or Trust Center changes. It checks both save commands, source bytes and independent document state, real exclusive locks on old backup/PDF outputs, successful replacement and save/close/reopen. A `DocumentBeforeClose` handler also introduces a late edit and requires its preservation after reopening. Pure regressions cover a cancelled save returning normally, unavailable/pending save state, generation/publication/restoration failures, recovery-path reporting and destination guards. Together these are three added regression scenarios; injected failures do not establish every native Word failure mode.
