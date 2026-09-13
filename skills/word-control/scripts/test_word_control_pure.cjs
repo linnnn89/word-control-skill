@@ -174,10 +174,17 @@ test('Cell text swaps preserve exact bodies on success and rollback, and reject 
         assert.deepEqual(bodies, [initial[1], initial[0]]);
         assert.equal(result.ok, true);
       } else {
-        assert.throws(() => context.commandSwapCellText(), mode === 'nested' ? /nested/ : /failed to swap/);
+        assert.throws(() => context.commandSwapCellText(), mode === 'nested' ? /nested/ : /Exit 3/);
         assert.deepEqual(bodies, before);
-        assert.equal(result, null);
-        if (mode === 'nested') assert.equal(writes, 0, 'Inspect both bodies before replacing either one');
+        if (mode === 'nested') {
+          assert.equal(result, null);
+          assert.equal(writes, 0, 'Inspect both bodies before replacing either one');
+        } else {
+          assert.equal(result.ok, false);
+          assert.equal(result.applied, false);
+          assert.equal(result.rolled_back, true);
+          assert.equal(result.fingerprint, null);
+        }
       }
     }
   } finally { Object.assign(context, original); }
@@ -822,6 +829,153 @@ test('Smoke preserves old output until a completed save is closed and published'
     assert.equal(folders.size, 1, 'Smoke staging folder leaked');
     if (phase !== 'startup') assert.equal(quit, true, 'Owned Word instance was not closed');
   }
+});
+
+test('Swap and shading retain applied state and rollback evidence when final inspection fails', () => {
+  const original = { getWord: context.getWord, tableFingerprint: context.tableFingerprint, emit: context.emit };
+  try {
+    for (const command of ['swap-cell-text', 'set-cell-shading']) {
+      for (const mode of ['postcheck-null', 'postcheck-throw', 'success', 'rollback-success', 'rollback-throws', 'rollback-silent', 'readback-unavailable']) {
+        let writes = 0, inspections = 0, result;
+        const bodies = ['LEFT\r', 'RIGHT\x0b'], initial = bodies.slice();
+        let color = 17, texture = 25;
+        function write(perform) {
+          writes++;
+          if (mode === 'rollback-silent' && writes >= 3) return;
+          perform();
+          if (mode.indexOf('rollback-') === 0 && writes === 2) throw new Error('Write interrupted');
+          if (mode === 'rollback-throws' && writes >= 3) throw new Error('Restore interrupted');
+        }
+        const shading = {
+          get Texture() { return mode === 'readback-unavailable' && writes === 2 ? NaN : texture; }, set Texture(value) { write(() => { texture = value; }); },
+          get BackgroundPatternColor() { return color; }, set BackgroundPatternColor(value) { write(() => { color = value; }); }
+        };
+        const cells = n => ({ Shading: shading, get Range() { return {
+          Start: n * 20, End: n * 20 + 10, get Text() {
+            if (mode === 'readback-unavailable' && writes === 2) throw new Error('Cell text unreadable');
+            return bodies[n - 1] + '\r\x07';
+          },
+          set Text(value) { write(() => { bodies[n - 1] = value; }); }
+        }; } }); cells.Count = 2;
+        const table = { Range: { Cells: cells } }, tables = () => table; tables.Count = 1;
+        const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', TrackRevisions: false, Tables: tables };
+        context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+        context.tableFingerprint = (table, errors) => {
+          if (++inspections === 1) return 'before';
+          if (mode === 'postcheck-null') { if (errors) errors.push('Final inspection incomplete'); return null; }
+          if (mode === 'postcheck-throw' || mode === 'rollback-throws') throw new Error('Final inspection unavailable');
+          return 'after';
+        };
+        context.emit = output => { result = JSON.parse(output); }; context.lastError = '';
+        context.ARGS = [command, '--table', '1', '--from-cell', '1', '--to-cell', '2', '--cell', '1', '--color', 'FF0000',
+          '--expect-path', doc.FullName, '--expect-table-fingerprint', 'before', '--yes'];
+        const run = () => command === 'swap-cell-text' ? context.commandSwapCellText() : context.commandSetCellShading();
+        if (mode === 'success') {
+          run();
+          assert.equal(result.ok, true); assert.equal(result.verified, true); assert.equal(result.applied, true);
+          assert.equal(result.readback.matches_requested, true); assert.equal(result.fingerprint, 'after');
+          assert.equal(result.failure_count, 0); assert.deepEqual(result.errors, []);
+          assert.equal(writes, 2, 'A verified result must not repeat the successful write');
+        } else {
+          assert.throws(run, /Exit 3/);
+          assert.equal(result.ok, false); assert.equal(result.verified, false); assert.equal(result.inspection_complete, false);
+          assert.equal(result.fingerprint, null, 'Never offer an incomplete or failed operation as a reusable guard');
+          if (mode.indexOf('postcheck-') === 0) {
+            assert.equal(result.applied, true); assert.equal(result.rolled_back, false);
+            assert.equal(result.readback.matches_requested, true); assert.equal(result.failure_count, 0);
+            assert.ok(result.errors.some(error => error.includes('Final inspection')));
+            assert.equal(writes, 2, 'A final-inspection failure must not replay or undo successful writes');
+          } else {
+            const restored = mode === 'rollback-success' || mode === 'readback-unavailable';
+            assert.ok(result.failures.some(error => mode === 'readback-unavailable' ? /unreadable|non-finite/.test(error) : error.includes('Write interrupted')));
+            assert.equal(result.applied, restored ? false : null);
+            assert.equal(result.rolled_back, restored);
+            assert.equal(result.rollback_failures.length === 0, restored);
+            if (mode === 'rollback-silent') assert.ok(result.rollback_failures.some(error => error.includes('readback')));
+            if (mode === 'rollback-throws') {
+              assert.ok(result.rollback_failures.some(error => error.includes('Restore interrupted')));
+              assert.ok(result.errors.some(error => error.includes('Final inspection unavailable')));
+            }
+          }
+        }
+        assert.equal(result.document.path, doc.FullName);
+        assert.equal(inspections, 2, 'Reuse the existing pre-write and post-write full inspections');
+        if (mode.indexOf('postcheck-') === 0 || mode === 'success') {
+          if (command === 'swap-cell-text') assert.deepEqual(bodies, [initial[1], initial[0]]);
+          else assert.deepEqual([texture, color], [0, 255]);
+        }
+        if (mode === 'rollback-success' || mode === 'readback-unavailable') {
+          if (command === 'swap-cell-text') assert.deepEqual(bodies, initial);
+          else assert.deepEqual([texture, color], [25, 17]);
+        }
+      }
+    }
+  } finally { Object.assign(context, original); }
+});
+
+test('Row and column results retain completed or uncertain writes through failed dimension and fingerprint reads', () => {
+  const original = { getWord: context.getWord, tableFingerprint: context.tableFingerprint, emit: context.emit };
+  const cases = [
+    ['insert-row', 'commandInsertRow', 'rows', 1, 4, 3],
+    ['delete-row', 'commandDeleteRow', 'rows', -1, 2, 3],
+    ['insert-column', 'commandInsertColumn', 'cols', 1, 3, 4],
+    ['delete-column', 'commandDeleteColumn', 'cols', -1, 3, 2]
+  ];
+  try {
+    for (const [command, method, axis, delta, expectedRows, expectedCols] of cases) {
+      for (const mode of ['postcheck-null', 'postcheck-throw', 'success', 'row-unreadable', 'col-unreadable', 'dimension-mismatch', 'invalid-count', 'write-throw', 'write-and-postcheck']) {
+        const dimensions = { rows: 3, cols: 3 };
+        let writes = 0, inspections = 0, result;
+        function mutate() {
+          writes++;
+          if (mode !== 'dimension-mismatch') dimensions[axis] += delta;
+          if (mode === 'write-throw' || mode === 'write-and-postcheck') throw new Error('Structural write interrupted');
+        }
+        function collection(name) {
+          const items = index => { assert.equal(index, 2); return { Delete: mutate }; };
+          items.Add = mutate;
+          Object.defineProperty(items, 'Count', { get() {
+            if (writes && (mode === 'row-unreadable' && name === 'rows' || mode === 'col-unreadable' && name === 'cols')) throw new Error(name + ' unavailable');
+            return writes && mode === 'invalid-count' && name === 'rows' ? NaN : dimensions[name];
+          } });
+          return items;
+        }
+        const table = { Rows: collection('rows'), Columns: collection('cols') }, tables = () => table; tables.Count = 1;
+        const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', TrackRevisions: false, Tables: tables };
+        context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+        context.tableFingerprint = (table, errors) => {
+          if (++inspections === 1) return 'before';
+          if (mode === 'postcheck-null') { if (errors) errors.push('Final inspection incomplete'); return null; }
+          if (mode === 'postcheck-throw' || mode === 'write-and-postcheck') throw new Error('Final inspection unavailable');
+          return 'after';
+        };
+        context.emit = text => { result = JSON.parse(text); }; context.lastError = '';
+        context.ARGS = [command, '--table', '1', '--before', '2', '--row', '2', '--col', '2',
+          '--expect-path', doc.FullName, '--expect-table-fingerprint', 'before', '--yes'];
+        if (mode === 'success') {
+          context[method]();
+          assert.equal(result.ok, true); assert.equal(result.verified, true); assert.equal(result.inspection_complete, true);
+          assert.equal(result.fingerprint, 'after'); assert.deepEqual(result.errors, []);
+          assert.equal(result.rows, expectedRows); assert.equal(result.cols, expectedCols);
+        } else {
+          assert.throws(() => context[method](), /Exit 3/);
+          assert.equal(result.ok, false); assert.equal(result.verified, false); assert.equal(result.inspection_complete, false);
+          assert.equal(result.fingerprint, null); assert.ok(result.errors.length);
+          if (mode === 'write-throw' || mode === 'write-and-postcheck') assert.ok(result.errors.some(error => error.includes('Structural write interrupted')));
+          if (mode === 'postcheck-throw' || mode === 'write-and-postcheck') assert.ok(result.errors.some(error => error.includes('Final inspection unavailable')));
+          if (mode === 'dimension-mismatch') assert.equal(result.error, 'dimension readback mismatch');
+          if (mode === 'row-unreadable' || mode === 'invalid-count') assert.equal(result.rows, null);
+          if (mode === 'col-unreadable') assert.equal(result.cols, null);
+        }
+        assert.equal(result.applied, mode === 'write-throw' || mode === 'write-and-postcheck' ? null : true);
+        assert.equal(result.document.path, doc.FullName);
+        assert.equal(result.readback.expected_rows, expectedRows); assert.equal(result.readback.expected_cols, expectedCols);
+        assert.equal(result.readback.matches_requested, ['row-unreadable', 'col-unreadable', 'invalid-count'].includes(mode) ? null : mode !== 'dimension-mismatch');
+        assert.equal(writes, 1, 'Structural writes must never be replayed or automatically reversed');
+        assert.equal(inspections, 2, 'Retain one live guard check and one final inspection');
+      }
+    }
+  } finally { Object.assign(context, original); }
 });
 
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));

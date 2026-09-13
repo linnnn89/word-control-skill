@@ -1418,21 +1418,64 @@ function commandSwapCellText() {
   if (Number(from.cell.Range.Start) === Number(to.cell.Range.Start)) die("source and destination cells must differ");
   var fromText = cellTextForSwap(from.cell);
   var toText = cellTextForSwap(to.cell);
-  var rollbackFailures = [];
+  var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, rolledBack = false, readback = "null", failures = [], rollbackFailures = [];
   try {
     setCellText(from.cell, toText);
     setCellText(to.cell, fromText);
-    if (cellTextForSwap(from.cell) !== toText || cellTextForSwap(to.cell) !== fromText) {
-      throw new Error("cell text readback did not match the requested swap");
-    }
+    applied = true;
+    var matches = cellTextForSwap(from.cell) === toText && cellTextForSwap(to.cell) === fromText;
+    readback = "{\"matches_requested\":" + boolJson(matches) + "}";
+    if (!matches) throw new Error("cell text readback did not match the requested swap");
   } catch (e1) {
+    failures.push(e1.message || String(e1));
     try { setCellText(from.cell, fromText); } catch (e2) { rollbackFailures.push("source:" + (e2.message || String(e2))); }
     try { setCellText(to.cell, toText); } catch (e3) { rollbackFailures.push("destination:" + (e3.message || String(e3))); }
-    die("failed to swap cell text: " + (e1.message || String(e1)) + (rollbackFailures.length ? "; rollback failures: " + rollbackFailures.join("; ") : "; changes rolled back"));
+    try {
+      if (cellTextForSwap(from.cell) !== fromText || cellTextForSwap(to.cell) !== toText) throw new Error("original cell text was not restored");
+    } catch (e4) { rollbackFailures.push("readback:" + (e4.message || String(e4))); }
+    rolledBack = rollbackFailures.length === 0;
+    applied = rolledBack ? false : null;
   }
-  emit("{\"ok\":true,\"action\":\"swap-cell-text\",\"table\":" + tableIndex
+  var errors = [], fingerprint = postWriteTableFingerprint(table, errors);
+  var verified = applied === true && failures.length === 0 && errors.length === 0 && fingerprint !== null;
+  var payload = "{\"ok\":" + boolJson(verified) + ",\"action\":\"swap-cell-text\",\"table\":" + tableIndex
     + ",\"from\":" + cellTargetJson(from) + ",\"to\":" + cellTargetJson(to)
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    + ",\"document\":" + documentJson + ",\"applied\":" + (applied === null ? "null" : boolJson(applied))
+    + ",\"verified\":" + boolJson(verified) + ",\"inspection_complete\":" + boolJson(verified) + ",\"readback\":" + readback
+    + ",\"failure_count\":" + failures.length + ",\"failures\":" + stringArrayJson(failures)
+    + ",\"rolled_back\":" + boolJson(rolledBack) + ",\"rollback_failures\":" + stringArrayJson(rollbackFailures)
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
+  emit(payload);
+}
+
+function emitTableStructureResult(table, contextJson, expectedRows, expectedCols, applied, errors) {
+  // Post-write reads must retain the operation state instead of exiting through a preflight helper.
+  var rows = null, cols = null;
+  try {
+    var rowCount = Number(table.Rows.Count);
+    if (!isFinite(rowCount) || rowCount < 1 || rowCount !== Math.floor(rowCount)) throw new Error("invalid row count");
+    rows = rowCount;
+  } catch (rowError) { errors.push("readback:rows:" + (rowError.message || String(rowError))); }
+  try {
+    var colCount = Number(table.Columns.Count);
+    if (!isFinite(colCount) || colCount < 1 || colCount !== Math.floor(colCount)) throw new Error("invalid column count");
+    cols = colCount;
+  } catch (colError) { errors.push("readback:cols:" + (colError.message || String(colError))); }
+  var matches = rows === null || cols === null ? null : rows === expectedRows && cols === expectedCols;
+  if (matches === false) errors.push("readback:dimension readback mismatch");
+  var fingerprint = postWriteTableFingerprint(table, errors);
+  var verified = applied === true && matches === true && errors.length === 0 && fingerprint !== null;
+  var payload = "{\"ok\":" + boolJson(verified) + "," + contextJson
+    + ",\"rows\":" + (rows === null ? "null" : rows) + ",\"cols\":" + (cols === null ? "null" : cols)
+    + ",\"applied\":" + (applied === null ? "null" : boolJson(applied)) + ",\"verified\":" + boolJson(verified)
+    + ",\"inspection_complete\":" + boolJson(verified) + ",\"readback\":{\"matches_requested\":" + (matches === null ? "null" : boolJson(matches))
+    + ",\"expected_rows\":" + expectedRows + ",\"expected_cols\":" + expectedCols + "}"
+    + (matches === false ? ",\"error\":\"dimension readback mismatch\"" : "")
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
+  emit(payload);
 }
 
 function commandInsertRow() {
@@ -1448,19 +1491,15 @@ function commandInsertRow() {
   var dimensions = getRegularTableDimensions(table, "insert-row");
   var before = beforeText ? parsePositiveInt(beforeText, "--before") : 0;
   if (before > dimensions.rows) die("--before row is out of range; table has " + dimensions.rows + " rows");
+  var contextJson = "\"action\":\"insert-row\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
+    + ",\"at_end\":" + boolJson(atEnd) + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, errors = [];
   try {
     if (atEnd) table.Rows.Add();
     else table.Rows.Add(table.Rows(before));
-  } catch (e) {
-    die("failed to insert row: " + e.message);
-  }
-  var after = getRegularTableDimensions(table, "insert-row readback");
-  if (after.rows !== dimensions.rows + 1 || after.cols !== dimensions.cols) {
-    failJson("{\"ok\":false,\"action\":\"insert-row\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
-  }
-  emit("{\"ok\":true,\"action\":\"insert-row\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
-    + ",\"at_end\":" + boolJson(atEnd) + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    applied = true;
+  } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitTableStructureResult(table, contextJson, dimensions.rows + 1, dimensions.cols, applied, errors);
 }
 
 function commandDeleteRow() {
@@ -1474,13 +1513,11 @@ function commandDeleteRow() {
   var dimensions = getRegularTableDimensions(table, "delete-row");
   if (dimensions.rows <= 1) die("refusing to delete the last row; use delete-table when deleting the whole table is intended");
   if (row > dimensions.rows) die("row index out of range; table has " + dimensions.rows + " rows");
-  try { table.Rows(row).Delete(); } catch (e) { die("failed to delete row: " + e.message); }
-  var after = getRegularTableDimensions(table, "delete-row readback");
-  if (after.rows !== dimensions.rows - 1 || after.cols !== dimensions.cols) {
-    failJson("{\"ok\":false,\"action\":\"delete-row\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
-  }
-  emit("{\"ok\":true,\"action\":\"delete-row\",\"table\":" + tableIndex + ",\"deleted_row\":" + row
-    + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+  var contextJson = "\"action\":\"delete-row\",\"table\":" + tableIndex + ",\"deleted_row\":" + row
+    + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, errors = [];
+  try { table.Rows(row).Delete(); applied = true; } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitTableStructureResult(table, contextJson, dimensions.rows - 1, dimensions.cols, applied, errors);
 }
 
 function commandInsertColumn() {
@@ -1496,19 +1533,15 @@ function commandInsertColumn() {
   var dimensions = getRegularTableDimensions(table, "insert-column");
   var before = beforeText ? parsePositiveInt(beforeText, "--before") : 0;
   if (before > dimensions.cols) die("--before column is out of range; table has " + dimensions.cols + " columns");
+  var contextJson = "\"action\":\"insert-column\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
+    + ",\"at_end\":" + boolJson(atEnd) + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, errors = [];
   try {
     if (atEnd) table.Columns.Add();
     else table.Columns.Add(table.Columns(before));
-  } catch (e) {
-    die("failed to insert column: " + e.message);
-  }
-  var after = getRegularTableDimensions(table, "insert-column readback");
-  if (after.cols !== dimensions.cols + 1 || after.rows !== dimensions.rows) {
-    failJson("{\"ok\":false,\"action\":\"insert-column\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
-  }
-  emit("{\"ok\":true,\"action\":\"insert-column\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
-    + ",\"at_end\":" + boolJson(atEnd) + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    applied = true;
+  } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitTableStructureResult(table, contextJson, dimensions.rows, dimensions.cols + 1, applied, errors);
 }
 
 function commandDeleteColumn() {
@@ -1522,13 +1555,11 @@ function commandDeleteColumn() {
   var dimensions = getRegularTableDimensions(table, "delete-column");
   if (dimensions.cols <= 1) die("refusing to delete the last column; use delete-table when deleting the whole table is intended");
   if (col > dimensions.cols) die("column index out of range; table has " + dimensions.cols + " columns");
-  try { table.Columns(col).Delete(); } catch (e) { die("failed to delete column: " + e.message); }
-  var after = getRegularTableDimensions(table, "delete-column readback");
-  if (after.cols !== dimensions.cols - 1 || after.rows !== dimensions.rows) {
-    failJson("{\"ok\":false,\"action\":\"delete-column\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
-  }
-  emit("{\"ok\":true,\"action\":\"delete-column\",\"table\":" + tableIndex + ",\"deleted_col\":" + col
-    + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+  var contextJson = "\"action\":\"delete-column\",\"table\":" + tableIndex + ",\"deleted_col\":" + col
+    + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, errors = [];
+  try { table.Columns(col).Delete(); applied = true; } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitTableStructureResult(table, contextJson, dimensions.rows, dimensions.cols - 1, applied, errors);
 }
 
 function commandSetCellShading() {
@@ -1543,21 +1574,38 @@ function commandSetCellShading() {
   var shading = target.cell.Shading;
   var previousColor = Number(shading.BackgroundPatternColor);
   var previousTexture = Number(shading.Texture);
+  var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, rolledBack = false, readback = "null", failures = [], rollbackFailures = [];
   try {
     shading.Texture = 0; // wdTextureNone: retain a solid background without a pattern.
     shading.BackgroundPatternColor = color;
-    if (Number(shading.Texture) !== 0 || Number(shading.BackgroundPatternColor) !== Number(color)) {
-      throw new Error("shading readback did not match requested texture or color");
-    }
+    applied = true;
+    var actualTexture = Number(shading.Texture), actualColor = Number(shading.BackgroundPatternColor);
+    if (!isFinite(actualTexture) || !isFinite(actualColor)) throw new Error("shading readback returned a non-finite value");
+    var matches = actualTexture === 0 && actualColor === Number(color);
+    readback = "{\"matches_requested\":" + boolJson(matches) + ",\"color_value\":" + actualColor + ",\"texture\":" + actualTexture + "}";
+    if (!matches) throw new Error("shading readback did not match requested texture or color");
   } catch (e1) {
-    var rollback = [];
-    try { shading.Texture = previousTexture; } catch (e2) { rollback.push("texture:" + (e2.message || String(e2))); }
-    try { shading.BackgroundPatternColor = previousColor; } catch (e3) { rollback.push("color:" + (e3.message || String(e3))); }
-    die("failed to set cell shading: " + (e1.message || String(e1)) + (rollback.length ? "; rollback failures: " + rollback.join("; ") : "; changes rolled back"));
+    failures.push(e1.message || String(e1));
+    try { shading.Texture = previousTexture; } catch (e2) { rollbackFailures.push("texture:" + (e2.message || String(e2))); }
+    try { shading.BackgroundPatternColor = previousColor; } catch (e3) { rollbackFailures.push("color:" + (e3.message || String(e3))); }
+    try {
+      if (Number(shading.Texture) !== previousTexture || Number(shading.BackgroundPatternColor) !== previousColor) throw new Error("original shading values were not restored");
+    } catch (e4) { rollbackFailures.push("readback:" + (e4.message || String(e4))); }
+    rolledBack = rollbackFailures.length === 0;
+    applied = rolledBack ? false : null;
   }
-  emit("{\"ok\":true,\"action\":\"set-cell-shading\",\"table\":" + tableIndex + ",\"target\":" + cellTargetJson(target)
+  var errors = [], fingerprint = postWriteTableFingerprint(table, errors);
+  var verified = applied === true && failures.length === 0 && errors.length === 0 && fingerprint !== null;
+  var payload = "{\"ok\":" + boolJson(verified) + ",\"action\":\"set-cell-shading\",\"table\":" + tableIndex + ",\"target\":" + cellTargetJson(target)
     + ",\"color\":" + q(colorHex) + ",\"color_value\":" + color + ",\"texture\":0"
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    + ",\"document\":" + documentJson + ",\"applied\":" + (applied === null ? "null" : boolJson(applied))
+    + ",\"verified\":" + boolJson(verified) + ",\"inspection_complete\":" + boolJson(verified) + ",\"readback\":" + readback
+    + ",\"failure_count\":" + failures.length + ",\"failures\":" + stringArrayJson(failures)
+    + ",\"rolled_back\":" + boolJson(rolledBack) + ",\"rollback_failures\":" + stringArrayJson(rollbackFailures)
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
+  emit(payload);
 }
 
 function commandSetBorders(scope) {
