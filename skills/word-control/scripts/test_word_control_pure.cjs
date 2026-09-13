@@ -1049,4 +1049,52 @@ test('Object deletion blocks tracked table writes and preserves uncertain or inc
   } finally { Object.assign(context, original); }
 });
 
+test('Open disables document macros and restores application security while retaining failure and ownership state', () => {
+  const original = { GetObject: context.GetObject, ActiveXObject: context.ActiveXObject, emit: context.emit };
+  const file = 'C:\\test\\open.docx'; existingFiles.add(file);
+  try {
+    for (const mode of ['success', 'low-default', 'already-disabled', 'read-failure', 'disable-throw', 'disable-silent', 'open-failure',
+      'restore-throw', 'restore-silent', 'open-and-restore-failure', 'owned-open-failure', 'owned-restore-failure']) {
+      const previous = mode === 'low-default' ? 1 : mode === 'already-disabled' ? 3 : 2;
+      const owned = mode.startsWith('owned-');
+      const openFailed = ['open-failure', 'open-and-restore-failure', 'owned-open-failure'].includes(mode);
+      const restoreFailed = ['restore-throw', 'restore-silent', 'open-and-restore-failure', 'owned-restore-failure'].includes(mode);
+      const prepareFailed = ['read-failure', 'disable-throw', 'disable-silent'].includes(mode);
+      let security = previous, writes = 0, opens = 0, quits = 0, documents = owned ? 0 : 1, result;
+      const word = { Visible: false,
+        get AutomationSecurity() { if (mode === 'read-failure') throw new Error('Security unavailable'); return security; },
+        set AutomationSecurity(value) {
+          writes++;
+          if (writes === 1 && mode === 'disable-silent' || writes === 2 && mode === 'restore-silent') return;
+          if (writes === 2 && restoreFailed) throw new Error('Security restoration interrupted');
+          security = value;
+          if (writes === 1 && mode === 'disable-throw') throw new Error('Disabling macros interrupted');
+        },
+        Documents: { get Count() { return documents; }, Open(path) {
+          assert.equal(path, file); assert.equal(security, 3, 'Never open a document without a verified macro guard'); opens++;
+          if (openFailed) throw new Error('Open interrupted');
+          documents++; return { FullName: path };
+        } }, Quit() { quits++; assert.ok(owned); assert.equal(documents, 0); }
+      };
+      context.GetObject = () => { if (owned) throw new Error('No running Word'); return word; };
+      context.ActiveXObject = function(name) { if (name === 'Word.Application') return word; return new original.ActiveXObject(name); };
+      context.emit = text => { result = JSON.parse(text); }; context.lastError = '';
+      context.ARGS = ['open', '--path', file];
+      const success = !prepareFailed && !openFailed && !restoreFailed;
+      if (success) context.commandOpen(); else assert.throws(() => context.commandOpen(), /Exit 3/);
+      assert.equal(result.ok, success); assert.equal(result.path, file);
+      assert.equal(result.opened, prepareFailed ? false : openFailed ? null : true);
+      assert.equal(result.automation_security_restored, mode === 'read-failure' ? null : !restoreFailed);
+      assert.equal(result.errors.length === 0, success);
+      assert.equal(opens, prepareFailed ? 0 : 1);
+      assert.equal(quits, mode === 'owned-open-failure' ? 1 : 0, 'Close only an empty Word instance created by this command');
+      if (!restoreFailed) assert.equal(security, previous);
+      if (mode === 'open-and-restore-failure') {
+        assert.ok(result.errors.some(error => error.includes('Open interrupted')));
+        assert.ok(result.errors.some(error => error.includes('Security restoration interrupted')));
+      }
+    }
+  } finally { existingFiles.delete(file); Object.assign(context, original); }
+});
+
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));

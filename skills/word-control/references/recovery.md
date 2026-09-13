@@ -1,5 +1,7 @@
 # Recovery and cleanup
 
+- `open` fails: retain its `opened`, `automation_security_restored` and `errors`. An open or restoration failure may leave a document open; inspect before retrying. Do not lower macro security to bypass a failed preparation check. The command restores only the Word application's previous automation setting; it does not edit Trust Center or registry policy.
+
 - `no running Word instance found`: open the intended document in desktop Word.
 - `active document path mismatch`: bring the intended document to the front and rerun `status`.
 - `selection ... changed`: rerun `selection-info`; use story type, start, end and hash from the same result.

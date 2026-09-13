@@ -24,6 +24,10 @@ Read-only commands are `help`, `status`, `selection`, `selection-info`, `documen
 
 Use the active document path returned by `status` as `<doc>`. For an unsaved document, use its exact name with `--expect-name` instead.
 
+To open a document, use `open --path "<doc>"`. The command temporarily sets Word's [AutomationSecurity](https://learn.microsoft.com/en-us/office/vba/api/word.application.automationsecurity) to force-disable document macros, verifies that setting before opening, and then restores the original value. Failure to establish the guard prevents the open call. This controls programmatic document macros, not every Office parser, add-in or external-content behavior.
+
+The open result retains `action` and `path`, and adds `opened`, `automation_security_restored` and `errors`. `opened:true` means Word returned an opened document; false means opening was not attempted, and null means the call threw with uncertain effects. Any preparation, open or restoration error returns a nonzero exit. Inspect the current documents and security state before retrying; a restoration failure can leave the requested document open. Failed opens only clean up an empty Word instance created by that command, never an existing user instance or an instance with documents.
+
 ### Scoped queries
 
 - `paragraphs --from N --max count` reads only the requested entries of Word's document paragraph collection. Indices are 1-based and remain absolute in the result. `--max` defaults to 80. With `--from`, the result adds `from` and `next_from`; `next_from:null` means the end. Starting beyond the end returns an empty page. These are live indices, not stable cursors across edits; refresh after document changes.

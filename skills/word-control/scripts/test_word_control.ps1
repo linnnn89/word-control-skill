@@ -203,8 +203,9 @@ try {
             throw "save/output regression failed; remaining Word process(es): $($guardWordPids -join ', ')`n$($guardOutput -join [Environment]::NewLine)"
         }
         $saveOutputGuards = ($guardOutput -join [Environment]::NewLine) | ConvertFrom-Json
-        if (-not $saveOutputGuards.ok -or -not $saveOutputGuards.saved_readback -or -not $saveOutputGuards.late_close_edit_preserved) { throw 'Save/output regression did not verify success' }
-        $saveOutputGuards | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDir 'save-output-guards.json') -Encoding UTF8
+        if (-not $saveOutputGuards.ok -or -not $saveOutputGuards.saved_readback -or -not $saveOutputGuards.late_close_edit_preserved -or
+            -not $saveOutputGuards.macro_disabled_open.ok) { throw 'Save/output/open regression did not verify success' }
+        $saveOutputGuards | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runDir 'save-output-guards.json') -Encoding UTF8
     }
 
     $fixtureDocument = 'not-requested'

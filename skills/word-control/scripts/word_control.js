@@ -1933,15 +1933,43 @@ function commandExportPdf() {
 function commandOpen() {
   var path = absPath(opt("--path", ""));
   if (!path || !fso.FileExists(path)) die("open requires existing --path file");
-  var word;
+  var word, owned = false;
   try {
     word = GetObject("", "Word.Application");
   } catch (e) {
     word = new ActiveXObject("Word.Application");
+    owned = true;
   }
-  word.Visible = true;
-  word.Documents.Open(path);
-  emit("{\"ok\":true,\"action\":\"open\",\"path\":" + q(path) + "}");
+  var previousSecurity = null, restored = null, attempted = false, opened = false, errors = [];
+  try {
+    var security = Number(word.AutomationSecurity);
+    if (security !== 1 && security !== 2 && security !== 3) throw new Error("unrecognized automation security setting");
+    previousSecurity = security;
+    word.AutomationSecurity = 3; // msoAutomationSecurityForceDisable, only during this open call.
+    if (Number(word.AutomationSecurity) !== 3) throw new Error("cannot confirm that document macros are disabled");
+    word.Visible = true;
+    attempted = true;
+    if (!word.Documents.Open(path)) throw new Error("Word did not return an opened document");
+    opened = true;
+  } catch (e) { errors.push((attempted ? "open:" : "prepare:") + (e.message || String(e))); }
+  if (previousSecurity !== null) {
+    try {
+      word.AutomationSecurity = previousSecurity;
+      if (Number(word.AutomationSecurity) !== previousSecurity) throw new Error("original automation security setting was not restored");
+      restored = true;
+    } catch (restoreError) { restored = false; errors.push("restore:" + (restoreError.message || String(restoreError))); }
+  }
+  if (errors.length && owned) {
+    try { if (Number(word.Documents.Count) === 0) word.Quit(0); }
+    catch (cleanupError) { errors.push("cleanup:" + (cleanupError.message || String(cleanupError))); }
+  }
+  var ok = opened && restored === true && errors.length === 0;
+  var payload = "{\"ok\":" + boolJson(ok) + ",\"action\":\"open\",\"path\":" + q(path)
+    + ",\"opened\":" + (opened ? "true" : attempted ? "null" : "false")
+    + ",\"automation_security_restored\":" + (restored === null ? "null" : boolJson(restored))
+    + ",\"errors\":" + stringArrayJson(errors) + "}";
+  if (!ok) failJson(payload, 3);
+  emit(payload);
 }
 
 function commandSmoke() {
