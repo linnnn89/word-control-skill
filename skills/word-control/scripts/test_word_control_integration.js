@@ -123,7 +123,7 @@ function captureCellBorders(table) {
   return result;
 }
 
-function captureInspectionFootprint(document, table, skipBorders) {
+function captureInspectionFootprint(document, table, skipBorders, skipShadingCell) {
   // Independent COM readback: no production fingerprint, XML normalizer or short hash.
   var values = [document.FullName, document.TrackRevisions], collections = ["Tables", "OMaths", "Comments", "Revisions",
     "Sections", "InlineShapes", "Shapes", "Fields", "Bookmarks", "Footnotes", "Endnotes"];
@@ -144,7 +144,8 @@ function captureInspectionFootprint(document, table, skipBorders) {
   for (var c = 1; c <= cells.Count; c++) {
     var cell = cells(c), range = cell.Range, font = range.Font;
     values.push(range.Start, range.End, String(range.Text), font.Name, font.Size, font.Bold, font.Italic, font.Color,
-      range.ParagraphFormat.Alignment, cell.Shading.BackgroundPatternColor, cell.Shading.Texture);
+      range.ParagraphFormat.Alignment, cell.Shading.ForegroundPatternColor);
+    if (c !== skipShadingCell) values.push(cell.Shading.BackgroundPatternColor, cell.Shading.Texture);
   }
   if (!skipBorders) values = values.concat(captureCellBorders(table));
   for (var v = 0; v < values.length; v++) { var text = String(values[v]); values[v] = text.length + ":" + text; }
@@ -207,6 +208,63 @@ function exerciseCellTextFidelity() {
       "--expect-table-fingerprint", String(nested.fingerprint), "--yes"]);
     assertTrue(captureInspectionFootprint(sample, table, false) === nestedBefore, "Nested-cell refusal changed the document");
   } finally { sample.Close(false); doc.Activate(); }
+}
+
+function exerciseVerifiedCellResults() {
+  var sample = word.Documents.Add(), originalBridge = bridge;
+  try {
+    sample.Content.Text = "before\rafter\r";
+    sample.Sections(1).Headers(1).Range.Text = "untouched header";
+    sample.Bookmarks.Add("outside_cells", sample.Range(0, 6));
+    var table = sample.Tables.Add(sample.Range(7, 7), 2, 3);
+    for (var c = 1; c <= 6; c++) { var range = table.Range.Cells(c).Range; range.End--; range.Text = "cell" + c; }
+    table.Range.Cells(5).Shading.BackgroundPatternColor = 16777215;
+    table.Range.Cells(5).Shading.Texture = 0;
+    var samplePath = fso.BuildPath(testDir, "verified-cell-results.docx"); sample.SaveAs2(samplePath);
+    sample.Close(false); sample = word.Documents.Open(samplePath); sample.Activate(); table = sample.Tables(1);
+    var before = captureInspectionFootprint(sample, table, false);
+    var shadeBefore = captureInspectionFootprint(sample, table, false, 5);
+    var source = readUtf8(bridge), needle = "function tableFingerprint(table, readErrors) {";
+    assertTrue(source.indexOf(needle) >= 0, "Final-inspection injection point missing");
+    var faultBridge = fso.BuildPath(testDir, "cell-final-inspection-failure.js");
+    writeUtf8(faultBridge, source.replace(needle, "var injectedPostChecks = 0;\n" + needle
+      + "\n  if (++injectedPostChecks === 2) { if (readErrors) readErrors.push('injected incomplete final inspection'); return null; }"));
+    var initial = runJson(["tables", "--table", "1"], "cell-result-initial.json").tables[0];
+    var fingerprint = initial.fingerprint;
+    for (var phase = 0; phase < 2; phase++) {
+      var command = phase === 0 ? "set-cell-shading" : "swap-cell-text";
+      var target = phase === 0 ? ["--cell", "5", "--color", "FF0000"] : ["--from-cell", "1", "--to-cell", "2"];
+      var args = [command, "--table", "1", "--expect-path", samplePath, "--expect-table-fingerprint", fingerprint, "--yes"];
+      var output = fso.BuildPath(testDir, command + "-failed-postcheck.json");
+      var outcome;
+      bridge = faultBridge;
+      try { outcome = requireFailure(args.concat(target, ["--output", output])); } finally { bridge = originalBridge; }
+      var failed = parseJsonFile(output);
+      assertTrue(outcome.code === 3 && failed.ok === false && failed.applied === true && failed.verified === false
+        && failed.inspection_complete === false && failed.fingerprint === null && failed.readback.matches_requested === true,
+        "An incomplete final inspection lost its applied state or authorized further writes");
+      assertTrue(failed.failure_count === 0 && failed.rolled_back === false && failed.errors.join(" ").indexOf("injected") >= 0,
+        "A final-inspection failure was confused with a write failure or rollback");
+      assertTrue(String(failed.document.path).toLowerCase() === samplePath.toLowerCase(), "Failure result lost document identity");
+      if (phase === 0) {
+        assertTrue(Number(table.Range.Cells(5).Shading.BackgroundPatternColor) === 255 && Number(table.Range.Cells(5).Shading.Texture) === 0,
+          "Shading failure receipt did not describe the native state");
+        assertTrue(captureInspectionFootprint(sample, table, false, 5) === shadeBefore, "Shading affected text, non-target formatting or document structure");
+      } else {
+        assertTrue(cleanWordCell(table.Range.Cells(1)) === "cell2" && cleanWordCell(table.Range.Cells(2)) === "cell1",
+          "Swap failure receipt did not describe the native state");
+      }
+      var fresh = runJson(["tables", "--table", "1"], command + "-recover-inspection.json").tables[0];
+      var restored = runJson([command, "--table", "1", "--expect-path", samplePath, "--expect-table-fingerprint", fresh.fingerprint, "--yes"]
+        .concat(phase === 0 ? ["--cell", "5", "--color", "FFFFFF"] : target), command + "-restored.json");
+      assertTrue(restored.ok && restored.applied && restored.verified && restored.inspection_complete && restored.readback.matches_requested
+        && restored.failure_count === 0 && restored.errors.length === 0 && restored.fingerprint, "Successful cell result was not reusable");
+      assertTrue(captureInspectionFootprint(sample, table, false) === before, "Cell recovery changed the independently captured scope");
+      fingerprint = restored.fingerprint;
+    }
+    sample.Save(); sample.Close(false); sample = word.Documents.Open(samplePath); sample.Activate();
+    assertTrue(captureInspectionFootprint(sample, sample.Tables(1), false) === before, "Cell-result scenario changed after save and reopen");
+  } finally { bridge = originalBridge; sample.Close(false); doc.Activate(); }
 }
 
 function exerciseXmlNormalization() {
@@ -317,6 +375,8 @@ function exerciseAdvancedTable(path, tableIndex, fingerprint, prefix) {
     "--from-row", "1", "--from-col", "1", "--to-row", "1", "--to-col", "3", "--expect-path", path, "--yes"
   ], prefix + "-advanced-swap.json");
   var table = doc.Tables(tableIndex);
+  assertTrue(swapped.applied && swapped.verified && swapped.inspection_complete && swapped.readback.matches_requested
+    && String(swapped.document.path).toLowerCase() === path.toLowerCase(), "swap result was not verified");
   assertTrue(cleanWordCell(table.Cell(1, 1)) === "C1" && cleanWordCell(table.Cell(1, 3)) === "A1", "cell text swap readback failed");
 
   var insertedRow = runJson([
@@ -346,6 +406,9 @@ function exerciseAdvancedTable(path, tableIndex, fingerprint, prefix) {
     "--row", "2", "--col", "2", "--color", "EAF2F8", "--expect-path", path, "--yes"
   ], prefix + "-advanced-shading.json");
   assertTrue(shading.color_value === 16315114, "cell shading color value mismatch");
+  assertTrue(shading.applied && shading.verified && shading.inspection_complete && shading.readback.matches_requested
+    && shading.readback.color_value === 16315114 && shading.readback.texture === 0
+    && String(shading.document.path).toLowerCase() === path.toLowerCase(), "shading result was not verified");
 
   var outerBorders = runJson([
     "set-table-borders", "--table", String(tableIndex), "--expect-table-fingerprint", String(shading.fingerprint),
@@ -410,7 +473,7 @@ var word = null;
 var doc = null;
 var failure = null;
 var savedWordOptions = {};
-var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"cell_text_fidelity":true,"backup":true,"pdf":true,"close":true}';
+var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"cell_text_fidelity":true,"verified_cell_results":true,"backup":true,"pdf":true,"close":true}';
 
 function exerciseScopedInspection() {
   var queryDoc = word.Documents.Add();
@@ -765,6 +828,7 @@ try {
   try { doc.SaveAs2(docPath); } catch (saveError) { doc.SaveAs(docPath); }
   exerciseXmlMutationDetection();
   exerciseCellTextFidelity();
+  exerciseVerifiedCellResults();
 
   word.Selection.SetRange(0, 4);
   runJson(["paragraphs"], "control-character-paragraphs.json");

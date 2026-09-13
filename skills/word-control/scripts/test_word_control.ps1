@@ -284,6 +284,7 @@ try {
         advanced_table_operations = $commandIntegration
         scoped_inspection = $commandIntegration
         cell_text_fidelity = $commandIntegration
+        verified_cell_results = $commandIntegration
         save_output_guards = $saveOutputGuards
         fixture_document = $fixtureDocument
     } | ConvertTo-Json -Compress -Depth 5

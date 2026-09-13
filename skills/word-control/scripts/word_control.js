@@ -1418,21 +1418,36 @@ function commandSwapCellText() {
   if (Number(from.cell.Range.Start) === Number(to.cell.Range.Start)) die("source and destination cells must differ");
   var fromText = cellTextForSwap(from.cell);
   var toText = cellTextForSwap(to.cell);
-  var rollbackFailures = [];
+  var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, rolledBack = false, readback = "null", failures = [], rollbackFailures = [];
   try {
     setCellText(from.cell, toText);
     setCellText(to.cell, fromText);
-    if (cellTextForSwap(from.cell) !== toText || cellTextForSwap(to.cell) !== fromText) {
-      throw new Error("cell text readback did not match the requested swap");
-    }
+    applied = true;
+    var matches = cellTextForSwap(from.cell) === toText && cellTextForSwap(to.cell) === fromText;
+    readback = "{\"matches_requested\":" + boolJson(matches) + "}";
+    if (!matches) throw new Error("cell text readback did not match the requested swap");
   } catch (e1) {
+    failures.push(e1.message || String(e1));
     try { setCellText(from.cell, fromText); } catch (e2) { rollbackFailures.push("source:" + (e2.message || String(e2))); }
     try { setCellText(to.cell, toText); } catch (e3) { rollbackFailures.push("destination:" + (e3.message || String(e3))); }
-    die("failed to swap cell text: " + (e1.message || String(e1)) + (rollbackFailures.length ? "; rollback failures: " + rollbackFailures.join("; ") : "; changes rolled back"));
+    try {
+      if (cellTextForSwap(from.cell) !== fromText || cellTextForSwap(to.cell) !== toText) throw new Error("original cell text was not restored");
+    } catch (e4) { rollbackFailures.push("readback:" + (e4.message || String(e4))); }
+    rolledBack = rollbackFailures.length === 0;
+    applied = rolledBack ? false : null;
   }
-  emit("{\"ok\":true,\"action\":\"swap-cell-text\",\"table\":" + tableIndex
+  var errors = [], fingerprint = postWriteTableFingerprint(table, errors);
+  var verified = applied === true && failures.length === 0 && errors.length === 0 && fingerprint !== null;
+  var payload = "{\"ok\":" + boolJson(verified) + ",\"action\":\"swap-cell-text\",\"table\":" + tableIndex
     + ",\"from\":" + cellTargetJson(from) + ",\"to\":" + cellTargetJson(to)
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    + ",\"document\":" + documentJson + ",\"applied\":" + (applied === null ? "null" : boolJson(applied))
+    + ",\"verified\":" + boolJson(verified) + ",\"inspection_complete\":" + boolJson(verified) + ",\"readback\":" + readback
+    + ",\"failure_count\":" + failures.length + ",\"failures\":" + stringArrayJson(failures)
+    + ",\"rolled_back\":" + boolJson(rolledBack) + ",\"rollback_failures\":" + stringArrayJson(rollbackFailures)
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
+  emit(payload);
 }
 
 function commandInsertRow() {
@@ -1543,21 +1558,38 @@ function commandSetCellShading() {
   var shading = target.cell.Shading;
   var previousColor = Number(shading.BackgroundPatternColor);
   var previousTexture = Number(shading.Texture);
+  var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, rolledBack = false, readback = "null", failures = [], rollbackFailures = [];
   try {
     shading.Texture = 0; // wdTextureNone: retain a solid background without a pattern.
     shading.BackgroundPatternColor = color;
-    if (Number(shading.Texture) !== 0 || Number(shading.BackgroundPatternColor) !== Number(color)) {
-      throw new Error("shading readback did not match requested texture or color");
-    }
+    applied = true;
+    var actualTexture = Number(shading.Texture), actualColor = Number(shading.BackgroundPatternColor);
+    if (!isFinite(actualTexture) || !isFinite(actualColor)) throw new Error("shading readback returned a non-finite value");
+    var matches = actualTexture === 0 && actualColor === Number(color);
+    readback = "{\"matches_requested\":" + boolJson(matches) + ",\"color_value\":" + actualColor + ",\"texture\":" + actualTexture + "}";
+    if (!matches) throw new Error("shading readback did not match requested texture or color");
   } catch (e1) {
-    var rollback = [];
-    try { shading.Texture = previousTexture; } catch (e2) { rollback.push("texture:" + (e2.message || String(e2))); }
-    try { shading.BackgroundPatternColor = previousColor; } catch (e3) { rollback.push("color:" + (e3.message || String(e3))); }
-    die("failed to set cell shading: " + (e1.message || String(e1)) + (rollback.length ? "; rollback failures: " + rollback.join("; ") : "; changes rolled back"));
+    failures.push(e1.message || String(e1));
+    try { shading.Texture = previousTexture; } catch (e2) { rollbackFailures.push("texture:" + (e2.message || String(e2))); }
+    try { shading.BackgroundPatternColor = previousColor; } catch (e3) { rollbackFailures.push("color:" + (e3.message || String(e3))); }
+    try {
+      if (Number(shading.Texture) !== previousTexture || Number(shading.BackgroundPatternColor) !== previousColor) throw new Error("original shading values were not restored");
+    } catch (e4) { rollbackFailures.push("readback:" + (e4.message || String(e4))); }
+    rolledBack = rollbackFailures.length === 0;
+    applied = rolledBack ? false : null;
   }
-  emit("{\"ok\":true,\"action\":\"set-cell-shading\",\"table\":" + tableIndex + ",\"target\":" + cellTargetJson(target)
+  var errors = [], fingerprint = postWriteTableFingerprint(table, errors);
+  var verified = applied === true && failures.length === 0 && errors.length === 0 && fingerprint !== null;
+  var payload = "{\"ok\":" + boolJson(verified) + ",\"action\":\"set-cell-shading\",\"table\":" + tableIndex + ",\"target\":" + cellTargetJson(target)
     + ",\"color\":" + q(colorHex) + ",\"color_value\":" + color + ",\"texture\":0"
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    + ",\"document\":" + documentJson + ",\"applied\":" + (applied === null ? "null" : boolJson(applied))
+    + ",\"verified\":" + boolJson(verified) + ",\"inspection_complete\":" + boolJson(verified) + ",\"readback\":" + readback
+    + ",\"failure_count\":" + failures.length + ",\"failures\":" + stringArrayJson(failures)
+    + ",\"rolled_back\":" + boolJson(rolledBack) + ",\"rollback_failures\":" + stringArrayJson(rollbackFailures)
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
+  emit(payload);
 }
 
 function commandSetBorders(scope) {
