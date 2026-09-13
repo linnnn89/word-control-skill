@@ -453,6 +453,58 @@ function postWriteTableFingerprint(table, errors) {
   catch (e) { errors.push("fingerprint:" + (e.message || String(e))); return null; }
 }
 
+function parseSnapshotXml(xml) {
+  if (xml.length > 8 * 1024 * 1024) throw new Error("XML comparison exceeds the 8 Mi-character snapshot limit");
+  var dom = new ActiveXObject("Msxml2.DOMDocument.6.0");
+  dom.async = false;
+  dom.preserveWhiteSpace = true;
+  dom.validateOnParse = false;
+  dom.resolveExternals = false;
+  dom.setProperty("ProhibitDTD", true);
+  if (!dom.loadXML(xml)) throw new Error("cannot parse XML comparison: " + dom.parseError.reason);
+  return dom;
+}
+
+function normalizeTableXml(xml) {
+  var dom = parseSnapshotXml(xml);
+  dom.setProperty("SelectionNamespaces", "xmlns:pkg='http://schemas.microsoft.com/office/2006/xmlPackage' xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'");
+  if (dom.selectNodes("/pkg:package/pkg:part[@pkg:name='/word/document.xml']/pkg:xmlData/w:document/w:body/w:tbl").length !== 1) {
+    throw new Error("XML comparison requires exactly one top-level table in the snapshot");
+  }
+  // Only editing-session metadata is removed; styles, themes, revisions and content remain.
+  var transform = parseSnapshotXml(
+    '<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+    + '<xsl:output method="xml" omit-xml-declaration="yes"/>'
+    + '<xsl:template match="@*|node()"><xsl:copy><xsl:apply-templates select="@*|node()"/></xsl:copy></xsl:template>'
+    + '<xsl:template match="@w:rsidR|@w:rsidRDefault|@w:rsidRPr|@w:rsidP|@w:rsidDel|@w:rsidTr|@w:rsidSect|w:settings/w:rsids"/>'
+    + '</xsl:stylesheet>');
+  return String(dom.transformNode(transform));
+}
+
+function compareTableXml(table) {
+  var started = new Date().getTime();
+  var result = { candidate: null, stable: null, sourceChars: null, normalizedChars: null, elapsedMs: 0, errors: [] };
+  try {
+    var source = String(table.Range.WordOpenXML);
+    result.sourceChars = source.length;
+    var first = normalizeTableXml(source);
+    result.normalizedChars = first.length;
+    var second = normalizeTableXml(String(table.Range.WordOpenXML));
+    result.stable = first === second;
+    if (!result.stable) throw new Error("normalized XML changed between consecutive reads");
+    result.candidate = "xml-v1:" + textHash(first);
+  } catch (e) { result.errors.push(e.message || String(e)); }
+  result.elapsedMs = new Date().getTime() - started;
+  return result;
+}
+
+function xmlComparisonJson(result) {
+  return "{\"version\":1,\"diagnostic_only\":true,\"candidate_hash\":" + (result.candidate === null ? "null" : q(result.candidate))
+    + ",\"stable_repeat\":" + (result.stable === null ? "null" : boolJson(result.stable))
+    + ",\"source_chars\":" + result.sourceChars + ",\"normalized_chars\":" + result.normalizedChars
+    + ",\"elapsed_ms\":" + result.elapsedMs + ",\"errors\":" + stringArrayJson(result.errors) + "}";
+}
+
 function equationFingerprint(equation, readErrors) {
   try { return textHash(normalizeText(equation.Range.Text)); }
   catch (e) {
@@ -464,6 +516,7 @@ function equationFingerprint(equation, readErrors) {
 
 function requireFingerprint(actual, optionName, unsafeFlag) {
   var expected = opt(optionName, "");
+  if (/^xml-v1:/i.test(expected)) die("experimental XML comparison hashes cannot authorize mutations");
   if (actual === null || typeof actual === "undefined") die("target inspection is incomplete");
   if (!expected && !hasFlag(unsafeFlag)) {
     die("target mutation requires " + optionName + " from a fresh inspection; use " + unsafeFlag + " only after manual verification");
@@ -745,6 +798,7 @@ function commandHelp() {
     "  paragraphs [--from index] [--max count] [--output file]",
     "  tables [--table index|--max count] [--detail full|text|summary] [--output file]",
     "  tables --table index --detail text [--cell-from index] [--cell-max count] [--output file]",
+    "  tables --table index --compare-xml [--expect-path file] [--output file] (diagnostic only)",
     "  equations [--index index] [--output file]",
     "  convert-equation --input file [--format latex|linear|word] [--output file]",
     "  enable-track-changes --expect-path file --yes",
@@ -926,6 +980,8 @@ function commandTables() {
   if (tableText && maxText) die("use either --table or --max, not both");
   var detail = opt("--detail", "full");
   if (detail !== "full" && detail !== "text" && detail !== "summary") die("--detail must be full, text or summary");
+  var compareXml = hasFlag("--compare-xml");
+  if (compareXml && (!tableText || detail !== "full")) die("XML comparison requires a single table with full detail");
   var cellPage = hasFlag("--cell-from") || hasFlag("--cell-max");
   if (cellPage && (!tableText || detail !== "text")) die("cell pagination requires --table and --detail text");
   var cellFrom = cellPage ? parsePositiveInt(opt("--cell-from", "1"), "--cell-from") : 1;
@@ -934,13 +990,14 @@ function commandTables() {
   var first = tableText ? parsePositiveInt(tableText, "--table") : 1;
   var word = getWord();
   var doc = getActiveDocument(word);
-  if (cellPage && (hasFlag("--expect-path") || hasFlag("--expect-name"))) requireExpectedDocument(doc);
+  if ((cellPage || compareXml) && (hasFlag("--expect-path") || hasFlag("--expect-name"))) requireExpectedDocument(doc);
   var tables = doc.Tables;
   var count = Number(tables.Count);
   if (tableText && first > count) die("table index out of range; document has " + count + " tables");
   var returned = tableText ? 1 : (maxText ? parsePositiveInt(maxText, "--max") : count);
   if (returned > count) returned = count;
   var parts = [];
+  var comparisonFailed = false;
   for (var i = first; i < first + returned; i++) {
     var table = tables(i);
     var rowCount = 0;
@@ -1011,6 +1068,16 @@ function commandTables() {
     }
     // Text-only inspection never supplies a guard; mutations still need full formatting reads.
     var fingerprint = detail === "full" ? tableFingerprint(table, readErrors) : null;
+    var comparison = null;
+    if (compareXml) {
+      comparison = readErrors.length ? { candidate: null, stable: null, sourceChars: null, normalizedChars: null,
+        elapsedMs: 0, errors: ["legacy table inspection is incomplete; XML comparison skipped"] } : compareTableXml(table);
+      if (comparison.errors.length) {
+        comparisonFailed = true;
+        fingerprint = null;
+        for (var e = 0; e < comparison.errors.length; e++) readErrors.push("xml-comparison:" + comparison.errors[e]);
+      }
+    }
     parts.push(tableInfo
       + ",\"layout\":" + q(cellPage ? "unverified" : (rectangular ? "rectangular" : "irregular"))
       + ",\"cell_count\":" + cellCount
@@ -1020,13 +1087,16 @@ function commandTables() {
       + ",\"read_errors\":" + stringArrayJson(readErrors)
       + ",\"cells\":[" + cells.join(",") + "]"
       + ",\"linear_cells\":[" + linearCells.join(",") + "]"
+      + (compareXml ? ",\"xml_comparison\":" + xmlComparisonJson(comparison) : "")
       + (cellPage ? ",\"cell_from\":" + cellFrom + ",\"returned_cells\":" + linearCells.length
         + ",\"next_cell\":" + (!readErrors.length && linearCells.length && cellFrom + linearCells.length <= cellCount ? cellFrom + linearCells.length : "null") : "") + "}");
   }
   var detailPart = hasFlag("--detail") ? ",\"detail\":" + q(detail) : "";
-  emit("{\"ok\":true,\"table_count\":" + count + ",\"returned\":" + returned + detailPart
-    + (cellPage ? ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}" : "")
-    + ",\"tables\":[" + parts.join(",") + "]}");
+  var payload = "{\"ok\":" + boolJson(!comparisonFailed) + ",\"table_count\":" + count + ",\"returned\":" + returned + detailPart
+    + (cellPage || compareXml ? ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}" : "")
+    + ",\"tables\":[" + parts.join(",") + "]}";
+  if (comparisonFailed) failJson(payload, 3);
+  emit(payload);
 }
 
 function commandEquations() {

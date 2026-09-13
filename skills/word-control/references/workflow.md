@@ -18,9 +18,11 @@ For discovery, use `find-text` in the relevant story, bounded paragraph pages or
    - Equations: run `equations --index N` and retain the target equation's `fingerprint`.
 4. Put non-ASCII input in a task-local UTF-8 file. Use an isolated temporary folder, not the document's source folder unless necessary.
 5. Execute one narrow mutation with `--yes`, the expected document path or name, and the fresh selection or object fingerprint.
-6. Verify the result. A successful `set-cell` with `verified:true`, matching document/target, `readback.matches_requested:true` and a non-null fingerprint already includes actual text readback and full post-write inspection; reuse this fresh fingerprint for the next operation without an extra full query. The next mutation still recomputes the live fingerprint. Otherwise re-run the relevant target inspection. Reinspect for additional scope or visual evidence, and never reuse a failed or incomplete result.
+6. Verify the result. A successful `set-cell` with `verified:true`, matching document/target, `readback.matches_requested:true` and a non-null fingerprint already includes actual text readback and full post-write inspection. The same result reuse applies to `set-table-borders`, `set-cell-borders` and `normalize-table-borders` when `ok`, `applied`, `verified` and `inspection_complete` are true, document/target match, errors/failures are empty and the fingerprint is non-null. Reuse that fingerprint for the next operation without an extra full query; the next mutation still recomputes the live fingerprint. Reinspect for additional scope or visual evidence, and never reuse a failed or incomplete result. After `create-table`, identify the new table before another indexed operation: `table_count` alone is not its index.
 7. Save, close, or export only when the user requested it. Never quit the user's Word application.
 8. Remove task-only JSON, TXT, TSV, and probe artifacts. Preserve source documents, backups, and requested review outputs.
+
+For acceptance, compare before/after state across the affected scope: the target, shared cell boundaries or neighboring content, and relevant document structure. A verified mutation result covers the command's own checks; it does not establish unchanged formatting, bookmarks or layout everywhere else. Reuse its guard while performing any additional checks required by the task, and investigate unexpected differences before saving or continuing dependent edits.
 
 ## Non-Negotiable Guards
 

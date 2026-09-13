@@ -111,6 +111,133 @@ function cleanWordCell(cell) {
   return String(cell.Range.Text).replace(/\x07/g, "").replace(/\r+$/g, "");
 }
 
+function captureCellBorders(table) {
+  var result = [], cells = table.Range.Cells;
+  for (var i = 1; i <= cells.Count; i++) {
+    var borders = cells(i).Borders;
+    for (var edge = 1; edge <= 4; edge++) {
+      var border = borders(-edge);
+      result.push(String(border.LineStyle) + ":" + border.Color + ":" + border.LineWidth);
+    }
+  }
+  return result;
+}
+
+function captureInspectionFootprint(document, table, skipBorders) {
+  // Independent COM readback: no production fingerprint, XML normalizer or short hash.
+  var values = [document.FullName, document.TrackRevisions], collections = ["Tables", "OMaths", "Comments", "Revisions",
+    "Sections", "InlineShapes", "Shapes", "Fields", "Bookmarks", "Footnotes", "Endnotes"];
+  for (var i = 0; i < collections.length; i++) values.push(document[collections[i]].Count);
+  for (var stories = new Enumerator(document.StoryRanges); !stories.atEnd(); stories.moveNext()) {
+    var story = stories.item();
+    while (story) {
+      values.push(story.StoryType, story.Start, story.End, String(story.Text));
+      story = story.NextStoryRange;
+    }
+  }
+  for (var b = 1; b <= document.Bookmarks.Count; b++) {
+    var bookmark = document.Bookmarks(b), bookmarked = bookmark.Range;
+    values.push(bookmark.Name, bookmarked.StoryType, bookmarked.Start, bookmarked.End);
+  }
+  var cells = table.Range.Cells;
+  values.push(cells.Count);
+  for (var c = 1; c <= cells.Count; c++) {
+    var cell = cells(c), range = cell.Range, font = range.Font;
+    values.push(range.Start, range.End, String(range.Text), font.Name, font.Size, font.Bold, font.Italic, font.Color,
+      range.ParagraphFormat.Alignment, cell.Shading.BackgroundPatternColor, cell.Shading.Texture);
+  }
+  if (!skipBorders) values = values.concat(captureCellBorders(table));
+  for (var v = 0; v < values.length; v++) { var text = String(values[v]); values[v] = text.length + ":" + text; }
+  return values.join("|");
+}
+
+function exerciseXmlNormalization() {
+  // Exercise the shipped normalizer in real MSXML, without substituting a different XML parser.
+  var source = readUtf8(bridge);
+  var start = source.indexOf("function parseSnapshotXml(");
+  var end = source.indexOf("function equationFingerprint(", start);
+  assertTrue(start >= 0 && end > start, "XML helper definitions missing");
+  eval(source.substring(start, end));
+  var xml = '<pkg:package xmlns:pkg="http://schemas.microsoft.com/office/2006/xmlPackage" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+    + '<pkg:part pkg:name="/word/document.xml"><pkg:xmlData><w:document><w:body><w:tbl><w:tr w:rsidTr="00000001"><w:tc><w:tcPr><w:shd w:fill="FFFFFF"/></w:tcPr><w:p w:rsidR="00000001"><w:r><w:t xml:space="preserve"> A </w:t></w:r><w:ins w:id="7"><w:r><w:t>B</w:t></w:r></w:ins></w:p></w:tc></w:tr></w:tbl></w:body></w:document></pkg:xmlData></pkg:part>'
+    + '<pkg:part pkg:name="/word/settings.xml"><pkg:xmlData><w:settings><w:rsids><w:rsid w:val="00000001"/></w:rsids></w:settings></pkg:xmlData></pkg:part>'
+    + '<pkg:part pkg:name="/word/styles.xml"><pkg:xmlData><w:styles><w:style w:styleId="S"><w:rsid w:val="00000002"/><w:tblPr><w:tblBorders><w:top w:val="single" w:color="000000"/></w:tblBorders></w:tblPr></w:style></w:styles></pkg:xmlData></pkg:part>'
+    + '<pkg:part pkg:name="/word/theme/theme1.xml"><pkg:xmlData><a:theme><a:themeElements><a:clrScheme><a:accent1><a:srgbClr val="336699"/></a:accent1></a:clrScheme></a:themeElements></a:theme></pkg:xmlData></pkg:part></pkg:package>';
+  var normalized = normalizeTableXml(xml);
+  assertTrue(normalized === normalizeTableXml(xml.replace(/00000001/g, "00000009")), "editing-session metadata changed normalization");
+  assertTrue(normalizeTableXml(xml.replace(">B<", "> <")) !== normalizeTableXml(xml.replace(">B<", ">  <")), "normalizer lost whitespace-only text");
+  var changes = [["> A <", "> A  <"], ['w:fill="FFFFFF"', 'w:fill="FF0000"'], ['w:color="000000"', 'w:color="112233"'],
+    ['val="336699"', 'val="669933"'], ['w:id="7"', 'w:id="8"'], ['w:val="00000002"', 'w:val="00000003"']];
+  for (var i = 0; i < changes.length; i++) {
+    assertTrue(normalized !== normalizeTableXml(xml.replace(changes[i][0], changes[i][1])), "normalizer lost content, formatting, revision or retained metadata");
+  }
+  var rejected = false;
+  try { normalizeTableXml('<!DOCTYPE pkg:package [<!ENTITY forbidden "EXPANDED">]>' + xml); }
+  catch (e) { rejected = true; }
+  assertTrue(rejected, "XML normalization accepted a DTD");
+  rejected = false;
+  try { normalizeTableXml('<not-a-table/>'); } catch (e2) { rejected = true; }
+  assertTrue(rejected, "XML normalization accepted a snapshot without a table");
+  rejected = false;
+  try { parseSnapshotXml(new Array(8 * 1024 * 1024 + 2).join("x")); }
+  catch (e3) { rejected = String(e3.message).indexOf("snapshot limit") >= 0; }
+  assertTrue(rejected, "XML normalization did not enforce the snapshot limit");
+}
+
+function exerciseXmlMutationDetection() {
+  var previous = doc, sample = null;
+  try {
+    sample = word.Documents.Add();
+    var path = fso.BuildPath(testDir, "xml-comparison.docx");
+    sample.Content.Text = "OUTSIDE BEFORE\rOUTSIDE AFTER\r";
+    var position = String("OUTSIDE BEFORE\r").length;
+    var table = sample.Tables.Add(sample.Range(position, position), 2, 2);
+    var range = table.Cell(1, 1).Range; range.End--; range.Text = "A";
+    sample.Bookmarks.Add("cross_table_boundary", sample.Range(table.Range.Start, sample.Content.End - 1));
+    sample.Footnotes.Add(sample.Range(2, 2)).Range.Text = "NOTE OUTSIDE TABLE";
+    sample.Comments.Add(sample.Range(0, 1), "COMMENT OUTSIDE TABLE");
+    sample.SaveAs2(path, 16);
+    var lastCandidate = null;
+    function inspect(name) {
+      var selectionStart = Number(word.Selection.Start), selectionEnd = Number(word.Selection.End), saved = Boolean(sample.Saved);
+      var footprint = captureInspectionFootprint(sample, table, false);
+      var result = runJson(["tables", "--table", "1", "--compare-xml", "--expect-path", path], "xml-" + name + ".json");
+      var comparison = result.tables[0].xml_comparison;
+      assertTrue(comparison.diagnostic_only === true && comparison.stable_repeat === true && comparison.errors.length === 0, "XML comparison did not complete: " + name);
+      assertTrue(/^xml-v1:[0-9a-f]{8}$/.test(comparison.candidate_hash), "XML candidate hash has no version");
+      assertTrue(Number(word.Selection.Start) === selectionStart && Number(word.Selection.End) === selectionEnd && Boolean(sample.Saved) === saved, "XML query changed selection or save state");
+      assertTrue(captureInspectionFootprint(sample, table, false) === footprint, "XML query changed document content, objects, bookmarks or table formatting: " + name);
+      if (lastCandidate !== null) assertTrue(comparison.candidate_hash !== lastCandidate, "XML comparison missed " + name);
+      lastCandidate = comparison.candidate_hash;
+      return result.tables[0];
+    }
+    var initial = inspect("initial");
+    var input = fso.BuildPath(testDir, "xml-cell.txt"); writeUtf8(input, "changed");
+    requireFailure(["set-cell", "--table", "1", "--cell", "1", "--input", input,
+      "--expect-table-fingerprint", lastCandidate, "--expect-path", path, "--yes"]);
+    assertTrue(cleanWordCell(table.Cell(1, 1)) === "A", "XML candidate authorized a write");
+    runJson(["set-cell", "--table", "1", "--cell", "1", "--input", input,
+      "--expect-table-fingerprint", initial.fingerprint, "--expect-path", path, "--yes"], "xml-set-cell.json");
+    inspect("text");
+    table.Cell(1, 1).Shading.BackgroundPatternColor = 255; inspect("shading");
+    table.Cell(1, 1).Borders(-1).LineStyle = 1; table.Cell(1, 1).Borders(-1).LineWidth = 8; inspect("border");
+    table.Rows.Add(); inspect("row");
+    table.Columns.Add(); inspect("column");
+    table.Cell(1, 1).Merge(table.Cell(1, 2)); inspect("merge");
+    sample.TrackRevisions = true;
+    range = table.Range.Cells(1).Range; range.Collapse(1); range.InsertBefore("TRACKED ");
+    sample.TrackRevisions = false;
+    assertTrue(Number(sample.Revisions.Count) > 0, "tracked XML fixture has no revision");
+    inspect("revision");
+    sample.Save();
+    var afterSave = runJson(["tables", "--table", "1", "--compare-xml", "--expect-path", path], "xml-after-save.json");
+    assertTrue(afterSave.tables[0].xml_comparison.stable_repeat === true, "XML is unstable after save");
+  } finally {
+    if (sample) sample.Close(false);
+    previous.Activate();
+  }
+}
+
 function exerciseAdvancedTable(path, tableIndex, fingerprint, prefix) {
   var cellInput = fso.BuildPath(testDir, prefix + "-advanced-cell.txt");
   writeUtf8(cellInput, "CENTER");
@@ -170,13 +297,25 @@ function exerciseAdvancedTable(path, tableIndex, fingerprint, prefix) {
     "set-table-borders", "--table", String(tableIndex), "--expect-table-fingerprint", String(outerBorders.fingerprint),
     "--edges", "inside-h,inside-v", "--style", "dotted", "--color", "A6A6A6", "--width", "0.5", "--expect-path", path, "--yes"
   ], prefix + "-advanced-inner-borders.json");
+  requireFailure([
+    "set-cell-borders", "--table", String(tableIndex), "--expect-table-fingerprint", String(outerBorders.fingerprint),
+    "--row", "2", "--col", "2", "--edges", "top", "--style", "none", "--expect-path", path, "--yes"
+  ]);
   table = doc.Tables(tableIndex);
   assertTrue(Number(table.Borders(-1).LineStyle) === 1, "outer table border style readback failed");
   assertTrue(Number(table.Borders(-5).LineStyle) === 2 && Number(table.Borders(-6).LineStyle) === 2, "inner table border style readback failed");
+  var borderScopeBefore = captureInspectionFootprint(doc, table, true), bordersBefore = captureCellBorders(table);
   var cellBorders = runJson([
     "set-cell-borders", "--table", String(tableIndex), "--expect-table-fingerprint", String(innerBorders.fingerprint),
     "--row", "2", "--col", "2", "--edges", "top,bottom", "--style", "double", "--color", "1F4E78", "--width", "0.75", "--expect-path", path, "--yes"
   ], prefix + "-advanced-cell-borders.json");
+  assertTrue(captureInspectionFootprint(doc, table, true) === borderScopeBefore, "cell borders changed text, font, shading, structure or surrounding stories");
+  var bordersAfter = captureCellBorders(table);
+  for (var borderIndex = 0; borderIndex < bordersBefore.length; borderIndex++) {
+    // The target's top/bottom edges share boundaries with the cells above/below it.
+    var allowed = borderIndex === 16 || borderIndex === 18 || borderIndex === 6 || borderIndex === 28;
+    if (!allowed) assertTrue(bordersAfter[borderIndex] === bordersBefore[borderIndex], "cell borders changed an unrelated boundary: " + borderIndex);
+  }
   var removedTop = runJson([
     "set-cell-borders", "--table", String(tableIndex), "--expect-table-fingerprint", String(cellBorders.fingerprint),
     "--row", "2", "--col", "2", "--edges", "top", "--style", "none", "--expect-path", path, "--yes"
@@ -548,6 +687,7 @@ try {
     successPayload = runFixture(fixtureCopy);
   } else {
   var docPath = fso.BuildPath(testDir, "command-integration.docx");
+  exerciseXmlNormalization();
   var wrongPath = fso.BuildPath(testDir, "wrong-document.docx");
   var replacementInput = fso.BuildPath(testDir, "replacement.txt");
   var tableInput = fso.BuildPath(testDir, "table.tsv");
@@ -565,6 +705,7 @@ try {
   doc = word.Documents.Add();
   doc.Content.Text = "seed text\rsoft\vline\rpage\fbreak\r";
   try { doc.SaveAs2(docPath); } catch (saveError) { doc.SaveAs(docPath); }
+  exerciseXmlMutationDetection();
 
   word.Selection.SetRange(0, 4);
   runJson(["paragraphs"], "control-character-paragraphs.json");
