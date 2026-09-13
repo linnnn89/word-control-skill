@@ -131,6 +131,58 @@ test('Incomplete formatting inspection has no reusable fingerprint', () => {
   }
 });
 
+test('Table guards distinguish trailing paragraphs, line breaks and cell boundaries', () => {
+  const borders = () => ({ LineStyle: 1, LineWidth: 4, Color: 0 });
+  const cell = { Shading: { BackgroundPatternColor: 0, Texture: 0 }, Borders: borders };
+  const cells = () => cell; cells.Count = 2;
+  const table = { Rows: { Count: 1 }, Columns: { Count: 2 }, Range: { Text: '', Cells: cells }, Borders: borders };
+  const states = ['A\r\x07B\r\x07', 'A\r\x07B\r\r\x07', 'A\rB\r\x07', 'A\n\x07B\r\x07', 'A\x0b\x07B\r\x07'];
+  const fingerprints = states.map(text => { table.Range.Text = text; return context.tableFingerprint(table); });
+  assert.equal(new Set(fingerprints).size, states.length, 'Distinct control characters must not collapse into the same guard input');
+  table.Range.Text = states[1];
+  context.ARGS = ['set-cell', '--expect-table-fingerprint', fingerprints[0]];
+  assert.throws(() => context.requireFingerprint(context.tableFingerprint(table), '--expect-table-fingerprint', '--allow-unverified-target'), /changed/);
+});
+
+test('Cell text swaps preserve exact bodies on success and rollback, and reject nested cell markers before writing', () => {
+  const original = { tableFingerprint: context.tableFingerprint, getWord: context.getWord, emit: context.emit };
+  const initial = ['A\r\r', 'B\x0bC\t\r'];
+  let bodies, writes, mode, result;
+  const cell = index => ({ get Range() { return { Start: index * 20, End: index * 20 + 10,
+    get Text() { return bodies[index] + '\r\x07'; },
+    set Text(value) {
+      writes++;
+      if (mode === 'mismatch' && writes === 2) value = value.replace(/\r+$/, '');
+      bodies[index] = value;
+      if (mode === 'write-error' && writes === 2) throw new Error('Second write interrupted');
+    } }; } });
+  const cells = n => cell(n - 1); cells.Count = 2;
+  const table = { Range: { Cells: cells } };
+  const tables = () => table; tables.Count = 1;
+  const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', TrackRevisions: false, Tables: tables };
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+  context.tableFingerprint = () => 'guard';
+  context.emit = text => { result = JSON.parse(text); };
+  context.ARGS = ['swap-cell-text', '--table', '1', '--from-cell', '1', '--to-cell', '2', '--expect-path', doc.FullName, '--expect-table-fingerprint', 'guard', '--yes'];
+  try {
+    for (mode of ['success', 'mismatch', 'write-error', 'nested']) {
+      bodies = initial.slice(); writes = 0; result = null; context.lastError = '';
+      if (mode === 'nested') bodies[1] = 'nested\r\x07text';
+      const before = bodies.slice();
+      if (mode === 'success') {
+        context.commandSwapCellText();
+        assert.deepEqual(bodies, [initial[1], initial[0]]);
+        assert.equal(result.ok, true);
+      } else {
+        assert.throws(() => context.commandSwapCellText(), mode === 'nested' ? /nested/ : /failed to swap/);
+        assert.deepEqual(bodies, before);
+        assert.equal(result, null);
+        if (mode === 'nested') assert.equal(writes, 0, 'Inspect both bodies before replacing either one');
+      }
+    }
+  } finally { Object.assign(context, original); }
+});
+
 test('Output preflight rejects document paths, collisions, and unapproved overwrite', () => {
   context.ARGS = ['help', '--output', 'C:\\test\\source.docx', '--overwrite'];
   assert.throws(() => context.preflightOutput(), /scratch/);

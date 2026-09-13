@@ -151,6 +151,64 @@ function captureInspectionFootprint(document, table, skipBorders) {
   return values.join("|");
 }
 
+function exerciseCellTextFidelity() {
+  var sample = word.Documents.Add(), table = null;
+  try {
+    sample.Content.Text = "before\rafter\r";
+    sample.Sections(1).Headers(1).Range.Text = "untouched header";
+    sample.Bookmarks.Add("outside_swap", sample.Range(0, 6));
+    table = sample.Tables.Add(sample.Range(7, 7), 1, 3);
+    var originals = ["A\r\r", "B\x0bC\t\r", "untouched"];
+    for (var i = 1; i <= 3; i++) {
+      var range = table.Cell(1, i).Range; range.End--; range.Text = originals[i - 1];
+    }
+    var samplePath = fso.BuildPath(testDir, "cell-text-fidelity.docx");
+    sample.SaveAs2(samplePath);
+    // Fresh Word documents expose empty header/footer stories that can disappear on first reopen.
+    // Establish a persisted baseline so the later comparison isolates the cell edits.
+    sample.Close(false); sample = word.Documents.Open(samplePath); sample.Activate(); table = sample.Tables(1);
+    var first = runJson(["tables", "--table", "1"], "fidelity-initial.json").tables[0];
+    var last = table.Cell(1, 3).Range; last.End--; last.Text = originals[2] + "\r";
+    var changed = runJson(["tables", "--table", "1"], "fidelity-paragraph-change.json").tables[0];
+    assertTrue(first.fingerprint !== changed.fingerprint, "Trailing cell paragraph did not change the guard");
+    var changedFootprint = captureInspectionFootprint(sample, table, false), savedBeforeRejection = Boolean(sample.Saved);
+    requireFailure(["swap-cell-text", "--table", "1", "--from-cell", "1", "--to-cell", "2", "--expect-path", samplePath,
+      "--expect-table-fingerprint", String(first.fingerprint), "--yes"]);
+    assertTrue(captureInspectionFootprint(sample, table, false) === changedFootprint && Boolean(sample.Saved) === savedBeforeRejection,
+      "Rejected stale guard changed the document");
+    last = table.Cell(1, 3).Range; last.End--; last.Text = originals[2];
+    var fresh = runJson(["tables", "--table", "1"], "fidelity-restored-baseline.json").tables[0];
+    var a = String(table.Cell(1, 1).Range.Text), b = String(table.Cell(1, 2).Range.Text), c = String(table.Cell(1, 3).Range.Text);
+    assertTrue(a === originals[0] + "\r\x07" && b === originals[1] + "\r\x07", "Native fixture did not retain exact break characters");
+    var tableText = String(table.Range.Text), body = String(sample.Content.Text);
+    assertTrue(tableText.indexOf(a + b + c) === 0 && body.indexOf(tableText) === body.lastIndexOf(tableText), "Unexpected native table serialization");
+    var expectedTable = b + a + c + tableText.substring(a.length + b.length + c.length);
+    var expectedBody = body.replace(tableText, expectedTable);
+    var before = captureInspectionFootprint(sample, table, false), paragraphs = Number(sample.Paragraphs.Count);
+    var swapped = runJson(["swap-cell-text", "--table", "1", "--from-cell", "1", "--to-cell", "2", "--expect-path", samplePath,
+      "--expect-table-fingerprint", String(fresh.fingerprint), "--yes"], "fidelity-swapped.json");
+    assertTrue(String(table.Cell(1, 1).Range.Text) === b && String(table.Cell(1, 2).Range.Text) === a, "Swap lost cell text or break characters");
+    assertTrue(String(sample.Content.Text) === expectedBody && Number(sample.Paragraphs.Count) === paragraphs, "Swap changed text outside its two target cells or paragraph count");
+    assertTrue(String(table.Cell(1, 3).Range.Text) === c && String(sample.Sections(1).Headers(1).Range.Text) === "untouched header\r",
+      "Swap changed the neighboring cell or header");
+    runJson(["save-active", "--expect-path", samplePath, "--yes"], "fidelity-saved.json");
+    sample.Close(false); sample = word.Documents.Open(samplePath); sample.Activate(); table = sample.Tables(1);
+    assertTrue(String(table.Cell(1, 1).Range.Text) === b && String(table.Cell(1, 2).Range.Text) === a && String(sample.Content.Text) === expectedBody,
+      "Saved/reopened swap lost exact cell text");
+    var reopened = runJson(["tables", "--table", "1"], "fidelity-reopened.json").tables[0];
+    runJson(["swap-cell-text", "--table", "1", "--from-cell", "1", "--to-cell", "2", "--expect-path", samplePath,
+      "--expect-table-fingerprint", String(reopened.fingerprint), "--yes"], "fidelity-swapped-back.json");
+    assertTrue(captureInspectionFootprint(sample, table, false) === before, "Swap round trip changed story text, objects, bookmarks, cell formatting or borders");
+    var nestedRange = table.Cell(1, 1).Range; nestedRange.Collapse(1);
+    sample.Tables.Add(nestedRange, 1, 1);
+    var nested = runJson(["tables", "--table", "1"], "fidelity-nested.json").tables[0];
+    var nestedBefore = captureInspectionFootprint(sample, table, false);
+    requireFailure(["swap-cell-text", "--table", "1", "--from-cell", "1", "--to-cell", "3", "--expect-path", samplePath,
+      "--expect-table-fingerprint", String(nested.fingerprint), "--yes"]);
+    assertTrue(captureInspectionFootprint(sample, table, false) === nestedBefore, "Nested-cell refusal changed the document");
+  } finally { sample.Close(false); doc.Activate(); }
+}
+
 function exerciseXmlNormalization() {
   // Exercise the shipped normalizer in real MSXML, without substituting a different XML parser.
   var source = readUtf8(bridge);
@@ -352,7 +410,7 @@ var word = null;
 var doc = null;
 var failure = null;
 var savedWordOptions = {};
-var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"backup":true,"pdf":true,"close":true}';
+var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"cell_text_fidelity":true,"backup":true,"pdf":true,"close":true}';
 
 function exerciseScopedInspection() {
   var queryDoc = word.Documents.Add();
@@ -703,9 +761,10 @@ try {
   word.Visible = false;
   word.DisplayAlerts = 0;
   doc = word.Documents.Add();
-  doc.Content.Text = "seed text\rsoft\vline\rpage\fbreak\r";
+  doc.Content.Text = "seed text\rsoft\x0bline\rpage\fbreak\r";
   try { doc.SaveAs2(docPath); } catch (saveError) { doc.SaveAs(docPath); }
   exerciseXmlMutationDetection();
+  exerciseCellTextFidelity();
 
   word.Selection.SetRange(0, 4);
   runJson(["paragraphs"], "control-character-paragraphs.json");

@@ -135,7 +135,7 @@ try {
             throw "isolated integration test left Word process(es): $($newWordPids -join ', ')`n$integrationText"
         }
         $integration = $integrationText | ConvertFrom-Json
-        if (-not $integration.ok -or -not $integration.advanced_tables -or -not $integration.scoped_inspection) {
+        if (-not $integration.ok -or -not $integration.advanced_tables -or -not $integration.scoped_inspection -or -not $integration.cell_text_fidelity) {
             throw 'isolated command integration returned an unsuccessful result'
         }
         $commandIntegration = 'passed'
@@ -231,6 +231,7 @@ try {
         guarded_command_integration = $commandIntegration
         advanced_table_operations = $commandIntegration
         scoped_inspection = $commandIntegration
+        cell_text_fidelity = $commandIntegration
         save_output_guards = $saveOutputGuards
         fixture_document = $fixtureDocument
     } | ConvertTo-Json -Compress -Depth 5
