@@ -114,6 +114,21 @@ test('Incomplete formatting inspection has no reusable fingerprint', () => {
   context.commandTables();
   assert.equal(result.tables[0].inspection_complete, false);
   assert.equal(result.tables[0].fingerprint, null);
+
+  table.Borders = cell.Borders = () => ({ LineStyle: 1, LineWidth: 4, Color: 0 });
+  const before = context.tableFingerprint(table);
+  cell.Shading.Texture = 100;
+  assert.notEqual(context.tableFingerprint(table), before, 'Texture must remain part of the guard');
+  cell.Shading.Texture = 0;
+  cell.Shading.BackgroundPatternColor = 255;
+  assert.notEqual(context.tableFingerprint(table), before, 'Background color must remain part of the guard');
+  for (const property of ['BackgroundPatternColor', 'Texture']) {
+    cell.Shading = { BackgroundPatternColor: 0, Texture: 0 };
+    Object.defineProperty(cell.Shading, property, { get() { throw new Error(property + ' unavailable'); } });
+    const shadingErrors = [];
+    assert.equal(context.tableFingerprint(table, shadingErrors), null);
+    assert.ok(shadingErrors.some(error => error.includes(property + ' unavailable')));
+  }
 });
 
 test('Output preflight rejects document paths, collisions, and unapproved overwrite', () => {
@@ -432,6 +447,114 @@ test('Literal search keeps story offsets and restores Find settings on success a
     assert.equal(result.inspection_complete, false); assert.match(result.read_errors[0], /interrupted/);
     assert.deepEqual(settings, initial, 'Failed search must restore user Find settings');
   } finally { context.readUtf8 = read; }
+});
+
+test('Table creation reports partial writes and never loses them to post-check errors', () => {
+  const original = { getWord: context.getWord, readUtf8: context.readUtf8, tableFingerprint: context.tableFingerprint };
+  let mode, created, values, result;
+  const table = { Rows: { Count: 1 }, Columns: { Count: 2 }, Cell: (row, col) => ({ Range: {
+    End: 10,
+    get Text() { return values[col - 1] + '\r\x07'; },
+    set Text(text) {
+      values[col - 1] = mode === 'mismatch' ? 'unexpected' : text;
+      if (mode === 'fill-error' && col === 2) throw new Error('Fill interrupted');
+    },
+  } }) };
+  const tables = { Add() {
+    created++;
+    if (mode === 'create-error') throw new Error('Creation interrupted');
+    return table;
+  }, get Count() {
+    if (mode === 'fill-error') throw new Error('Table count unavailable');
+    return created;
+  } };
+  const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx',
+    Tables: tables, Content: { End: 1 }, Range: () => ({}) };
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+  context.readUtf8 = () => 'A\tB';
+  context.tableFingerprint = () => {
+    if (mode === 'fill-error' || mode === 'postcheck-error') throw new Error('Post-check unavailable');
+    return 'after';
+  };
+  context.emit = output => { result = JSON.parse(output); };
+  try {
+    for (mode of ['success', 'fill-error', 'postcheck-error', 'create-error', 'mismatch']) {
+      created = 0; values = ['', '']; result = null; context.lastError = '';
+      context.ARGS = ['create-table', '--rows', '1', '--cols', '2', '--input', 'table.tsv',
+        '--at', 'end', '--expect-path', doc.FullName, '--yes'];
+      if (mode === 'success') {
+        context.commandCreateTable();
+        assert.equal(result.verified, true);
+        assert.equal(result.fingerprint, 'after');
+        assert.deepEqual(values, ['A', 'B']);
+      } else {
+        assert.throws(() => context.commandCreateTable(), /Exit 3/);
+        assert.equal(result.ok, false);
+        assert.equal(result.verified, false);
+        assert.equal(result.inspection_complete, false);
+        assert.equal(result.fingerprint, null);
+        if (mode === 'fill-error') {
+          assert.equal(result.fill_complete, false);
+          assert.equal(result.table_count, null);
+          for (const error of ['Fill interrupted', 'Table count unavailable', 'Post-check unavailable']) {
+            assert.ok(result.errors.some(value => value.includes(error)), error);
+          }
+        }
+        if (mode === 'mismatch') assert.ok(result.errors.some(value => value.includes('readback')));
+      }
+      assert.equal(created, 1, 'A failed creation must not be retried or silently deleted');
+      assert.equal(result.applied, mode === 'create-error' ? null : true);
+      assert.equal(result.document.path, doc.FullName);
+    }
+  } finally { Object.assign(context, original); }
+});
+
+test('Border results retain write and rollback failures when final inspection also fails', () => {
+  const original = { getWord: context.getWord, tableFingerprint: context.tableFingerprint };
+  let mode, result, inspections, colorWrites, color;
+  const border = { LineStyle: 1, LineWidth: 4, get Color() { return color; }, set Color(value) {
+    color = value;
+    if (mode !== 'postcheck-only') throw new Error(++colorWrites === 1 ? 'Write failed' : 'Rollback failed');
+  } };
+  const borders = () => border;
+  const cells = () => ({ Borders: borders }); cells.Count = 1;
+  const table = { Borders: borders, Range: { Cells: cells } };
+  const tables = () => table; tables.Count = 1;
+  const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', Tables: tables };
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+  context.tableFingerprint = () => {
+    if (++inspections === 1) return 'before';
+    if (mode !== 'write-only') throw new Error('Post-check unavailable');
+    return 'after';
+  };
+  context.emit = output => { result = JSON.parse(output); };
+  try {
+    for (const command of ['set-table-borders', 'set-cell-borders', 'normalize-table-borders']) {
+      for (mode of ['write-and-postcheck', 'write-only', 'postcheck-only']) {
+        inspections = 0; colorWrites = 0; color = 0; result = null; context.lastError = '';
+        context.ARGS = [command, '--table', '1', '--cell', '1', '--edges', 'top',
+          '--expect-path', doc.FullName, '--expect-table-fingerprint', 'before', '--yes'];
+        assert.throws(() => command === 'normalize-table-borders' ? context.commandNormalizeTableBorders()
+          : context.commandSetBorders(command === 'set-table-borders' ? 'table' : 'cell'), /Exit 3/);
+        assert.equal(result.ok, false);
+        assert.equal(result.verified, false);
+        assert.equal(result.inspection_complete, false);
+        assert.equal(result.fingerprint, null, 'Even a readable post-check cannot authorize retry after failed writes');
+        assert.equal(result.applied, mode === 'postcheck-only' ? true : null);
+        assert.equal(result.document.path, doc.FullName);
+        assert.equal(inspections, 2, 'Keep both live pre-check and post-check');
+        if (mode !== 'postcheck-only') {
+          assert.ok(result.failures.some(value => value.includes('Write failed')));
+          assert.equal(result.failure_count, result.failures.length);
+          if (command !== 'normalize-table-borders') {
+            assert.ok(result.rollback_failures.some(value => value.includes('Rollback failed')));
+            assert.equal(result.rolled_back, false);
+          }
+        }
+        if (mode !== 'write-only') assert.ok(result.errors.some(value => value.includes('Post-check unavailable')));
+      }
+    }
+  } finally { Object.assign(context, original); }
 });
 
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));
