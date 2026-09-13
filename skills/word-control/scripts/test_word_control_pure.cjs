@@ -64,6 +64,104 @@ test('LaTeX validates original tokens and braces', () => {
   assert.equal(context.equationInputText(), '√(a/b)');
 });
 
+test('LaTeX script groups retain their nesting and exclude following baseline text', () => {
+  const cases = [
+    ['x^{2}y', 'x^(2) y'], ['x_{i}y', 'x_(i) y'], ['x^{ab}', 'x^(ab)'],
+    ['x^{a_{b}}', 'x^(a_(b))'], ['x_{a^{b}}', 'x_(a^(b))'],
+    ['x^{a^{b}}', 'x^(a^(b))'], ['x_{a_{b}}', 'x_(a_(b))'],
+    ['x_{i}^{j}', 'x_(i)^(j)'], ['x^{}y', 'xy'],
+    ['\\frac{x^{2}y}{z}', '(x^(2) y)/z'], ['x^{\\alpha_{i}}', 'x^(α_(i))'],
+  ];
+  for (const [latex, expected] of cases) assert.equal(context.convertLatexToWordLinear(latex), expected);
+});
+
+test('Equation construction confirms UnicodeMath before writing and restores the prior input mode on every exit', () => {
+  for (const mode of ['unicode', 'latex', 'unknown', 'read-failure', 'prepare-noop', 'prepare-throw', 'prepare-partial', 'build-failure', 'restore-noop', 'restore-throw', 'combined-failure']) {
+    let current = mode === 'unicode' ? 'EquationUnicodeFormat' : 'EquationLaTexFormat';
+    let writes = 0, builds = 0;
+    const calls = [];
+    const bars = {
+      GetPressedMso(id) {
+        if (mode === 'read-failure') throw new Error('Mode read unavailable');
+        return mode === 'unknown' ? false : id === current;
+      },
+      ExecuteMso(id) {
+        calls.push(id);
+        if (id === 'EquationUnicodeFormat') {
+          if (mode === 'prepare-noop') return;
+          if (mode === 'prepare-throw') throw new Error('Preparation interrupted');
+          current = id;
+          if (mode === 'prepare-partial') throw new Error('Preparation interrupted after switch');
+        } else {
+          if (mode === 'restore-noop') return;
+          if (mode === 'restore-throw' || mode === 'combined-failure') throw new Error('Restoration interrupted');
+          current = id;
+        }
+      },
+    };
+    const result = { OMaths() { return { BuildUp() { builds++; if (mode === 'build-failure' || mode === 'combined-failure') throw new Error('BuildUp interrupted'); } }; } };
+    const doc = { Application: { CommandBars: bars }, OMaths: { Add() { return result; } } };
+    const range = { Start: 3, Duplicate: { SetRange() {} }, set Text(value) { assert.equal(current, 'EquationUnicodeFormat'); assert.equal(value, '(a+b)/c'); writes++; } };
+    if (mode === 'unicode' || mode === 'latex') assert.equal(context.buildEquationInRange(doc, range, '(a+b)/c'), result);
+    else assert.throws(() => context.buildEquationInRange(doc, range, '(a+b)/c'), error => {
+      if (mode === 'combined-failure') assert.match(error.message, /BuildUp interrupted.*restoration failed.*Restoration interrupted/);
+      else assert.match(error.message, /mode|Mode|Preparation|BuildUp/);
+      return true;
+    });
+    const blocked = ['unknown', 'read-failure', 'prepare-noop', 'prepare-throw', 'prepare-partial'].includes(mode);
+    assert.equal(writes, blocked ? 0 : 1, 'Mode preparation failure must precede document writes; never replay a partial build');
+    assert.equal(builds, blocked ? 0 : 1);
+    if (['restore-noop', 'restore-throw', 'combined-failure'].includes(mode)) assert.equal(current, 'EquationUnicodeFormat');
+    else assert.equal(current, mode === 'unicode' ? 'EquationUnicodeFormat' : 'EquationLaTexFormat');
+    if (['unicode', 'unknown', 'read-failure'].includes(mode)) assert.deepEqual(calls, []);
+    else assert.deepEqual(calls, ['EquationUnicodeFormat', 'EquationLaTexFormat']);
+  }
+  const originalBuild = context.buildEquationContent;
+  try {
+    for (const failure of ['', 'type', 'clone', 'build', 'publish', 'close', 'combined']) {
+      let mode = 'EquationLaTexFormat', built = false, sourceWrites = 0, closes = 0, creates = 0;
+      const bars = { GetPressedMso: id => id === mode, ExecuteMso(id) {
+        if (failure === 'combined' && id === 'EquationLaTexFormat') throw new Error('restore failed');
+        mode = id;
+      } };
+      const originalMath = { Type: failure === 'type' ? 99 : 0, Remove() { assert.fail('Never remove the source equation'); } };
+      const scratchRange = {};
+      const scratchMath = { Type: 1, Range: { Duplicate: scratchRange, FormattedText: 'built math' }, Remove() {} };
+      const scratchMaths = () => scratchMath;
+      scratchMaths.Count = 1;
+      const scratch = { Name: 'owned scratch', OMaths: scratchMaths, Content: { set FormattedText(value) {
+        assert.equal(value, 'original formatting');
+        if (failure === 'clone') throw new Error('clone failed');
+      } }, Close(save) { assert.equal(save, 0); closes++; if (['close', 'combined'].includes(failure)) throw new Error('close failed'); } };
+      const doc = { Application: { CommandBars: bars, Documents: { Add(template, newTemplate, type, visible) {
+        assert.equal(visible, false); creates++; return scratch;
+      } } }, get TrackRevisions() { return true; }, set TrackRevisions(value) { assert.fail('Do not change source tracking'); } };
+      const range = { get FormattedText() { return 'original formatting'; }, set FormattedText(value) {
+        assert.ok(built, 'Build the replacement before touching the source');
+        assert.equal(mode, 'EquationUnicodeFormat'); assert.equal(scratchMath.Type, originalMath.Type);
+        assert.equal(value, 'built math'); sourceWrites++;
+        if (failure === 'publish') throw new Error('publish failed');
+      }, set Text(value) { assert.fail('Do not rebuild in the source range'); } };
+      context.buildEquationContent = (target, targetRange, text) => {
+        assert.equal(target, scratch); assert.equal(targetRange, scratchRange);
+        assert.equal(target.TrackRevisions, false); assert.equal(text, '(a+b)/c');
+        if (['build', 'combined'].includes(failure)) throw new Error('build failed');
+        built = true;
+      };
+      if (!failure) assert.equal(context.buildEquationInRange(doc, range, '(a+b)/c', originalMath), range);
+      else assert.throws(() => context.buildEquationInRange(doc, range, '(a+b)/c', originalMath), error => {
+        if (failure === 'combined') assert.match(error.message, /build failed.*owned scratch.*close failed.*restoration failed.*restore failed/);
+        else assert.match(error.message, new RegExp(failure));
+        return true;
+      });
+      assert.equal(sourceWrites, ['', 'publish', 'close'].includes(failure) ? 1 : 0);
+      assert.equal(closes, creates, 'Close only the temporary document, including after a failed build');
+      assert.equal(mode, failure === 'combined' ? 'EquationUnicodeFormat' : 'EquationLaTexFormat');
+      assert.equal(doc.TrackRevisions, true);
+    }
+  } finally { context.buildEquationContent = originalBuild; }
+});
+
 const range = { Start: 0, End: 4, Text: 'same', StoryType: 1 };
 const selection = context.selectionSnapshot({ Selection: { Range: range, Type: 2 } });
 const guards = ['--expect-story-type', '1', '--expect-start', '0', '--expect-end', '4', '--expect-selection-hash', selection.hash];

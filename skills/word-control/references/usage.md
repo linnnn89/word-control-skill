@@ -172,9 +172,11 @@ cscript //nologo $wc set-equation --index 1 --expect-equation-fingerprint <hash>
 cscript //nologo $wc delete-equation --index 1 --expect-equation-fingerprint <hash> --expect-path "<doc>" --yes
 ```
 
-The conservative LaTeX converter supports common fractions, square roots, integrals, sums, products, superscripts, subscripts, comparisons and Greek letters. Unknown commands, complex environments such as `align`, `matrix`, `cases`, and custom macros are unsupported. Use `--format linear` only after checking Word linear syntax.
+The conservative LaTeX converter supports common fractions, square roots, integrals, sums, products, superscripts, subscripts, comparisons and Greek letters. Explicit script groups retain nesting and terminate before following baseline text, including `x^{a_{b}}` and `x^{2}y`. Unknown commands, complex environments such as `align`, `matrix`, `cases`, and custom macros are unsupported. `--format linear` and its `word` alias expect UnicodeMath; check that syntax before use.
 
-Verify the resulting OMath object after insertion or replacement. When layout matters, export a PDF for visual review.
+Equation construction confirms Word's UnicodeMath input mode before editing and restores the previous mode afterward. Unavailable or unconfirmed mode controls stop construction. For an existing equation, use `set-equation`: it builds a replacement in a hidden temporary document, then copies formatted content into the guarded target while retaining the source document's Track Changes policy. It closes only that temporary document. Cleanup or mode-restoration errors are command failures even if the equation has already changed; follow [Recovery](recovery.md) before another write.
+
+Verify the resulting OMath structure after insertion or replacement: check fraction numerator/denominator, nested script levels and following baseline text, as well as target formatting and neighboring content. A successful `BuildUp` call and non-null fingerprint do not prove mathematical equivalence. When layout matters, export a PDF for visual review. Insertion into an existing math zone is outside the tested acceptance; use the guarded replacement command for existing formulas.
 
 For `delete-equation`, follow the [deletion result contract](#deletion-results), especially when Track Changes is enabled.
 
