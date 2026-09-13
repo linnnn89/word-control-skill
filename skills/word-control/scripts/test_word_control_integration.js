@@ -344,6 +344,119 @@ function exerciseStructureResults() {
   } finally { bridge = originalBridge; sample.Close(false); doc.Activate(); }
 }
 
+function exerciseDeletionResults() {
+  var originalBridge = bridge;
+  function unaffectedState(sample, collectionName, lastIndex) {
+    var values = [sample.TrackRevisions], names = ["Tables", "OMaths", "Sections", "Fields", "InlineShapes", "Shapes", "Bookmarks", "Comments", "Footnotes", "Endnotes"];
+    for (var n = 0; n < names.length; n++) if (names[n] !== collectionName) values.push(names[n], sample[names[n]].Count);
+    for (var s = 2; s <= 17; s++) {
+      var story = null;
+      try { story = sample.StoryRanges(s); } catch (missingStory) {}
+      while (story) { values.push(s, String(story.Text)); story = story.NextStoryRange; }
+    }
+    for (var b = 1; b <= sample.Bookmarks.Count; b++) {
+      var bookmark = sample.Bookmarks(b); values.push(bookmark.Name, bookmark.Range.Start, bookmark.Range.End, String(bookmark.Range.Text));
+    }
+    var indices = [1, lastIndex];
+    for (var i = 0; i < indices.length; i++) {
+      var item = sample[collectionName](indices[i]), range = item.Range;
+      values.push(String(range.Text), range.Font.Name, range.Font.Size, range.Font.Bold, range.Font.Italic, range.Font.Color);
+      if (collectionName === "OMaths") values.push(item.Type, range.ParagraphFormat.Alignment, range.ParagraphFormat.SpaceBefore, range.ParagraphFormat.SpaceAfter);
+      if (collectionName === "Tables") {
+        values = values.concat(captureCellBorders(item));
+        for (var c = 1; c <= item.Range.Cells.Count; c++) {
+          var cell = item.Range.Cells(c), font = cell.Range.Font, shade = cell.Shading;
+          values.push(String(cell.Range.Text), font.Name, font.Size, font.Bold, font.Italic, font.Color,
+            shade.BackgroundPatternColor, shade.ForegroundPatternColor, shade.Texture, cell.Range.ParagraphFormat.Alignment);
+        }
+      }
+    }
+    for (var v = 0; v < values.length; v++) { var text = String(values[v]); values[v] = text.length + ":" + text; }
+    return values.join("|");
+  }
+  var source = readUtf8(bridge), needle = "var afterCount = Number(doc[collectionName].Count);";
+  assertTrue(source.indexOf(needle) >= 0, "Deletion readback injection point missing");
+  var faultBridge = fso.BuildPath(testDir, "deletion-readback-failure.js");
+  writeUtf8(faultBridge, source.replace(needle, "throw new Error('injected deletion count read failure');\n    " + needle));
+  for (var kind = 0; kind < 2; kind++) for (var mode = 0; mode < 4; mode++) {
+    if (kind === 1 && mode === 2) continue;
+    var collectionName = kind === 0 ? "Tables" : "OMaths", command = kind === 0 ? "delete-table" : "delete-equation";
+    var tracked = mode >= 2, blocked = mode === 2, readFailure = mode === 1;
+    var sample = word.Documents.Add();
+    try {
+      sample.Content.Text = "PREFIX\r";
+      sample.Sections(1).Headers(1).Range.Text = "untouched deletion header";
+      sample.Bookmarks.Add("outside_deletion", sample.Range(0, 6));
+      for (var itemIndex = 1; itemIndex <= 3; itemIndex++) {
+        var end = sample.Content.End - 1;
+        sample.Range(end, end).Text = "ITEM " + itemIndex + "\r";
+        end = sample.Content.End - 1;
+        if (kind === 0) {
+          var table = sample.Tables.Add(sample.Range(end, end), 2, 2);
+          for (var cellIndex = 1; cellIndex <= 4; cellIndex++) {
+            var cellRange = table.Range.Cells(cellIndex).Range; cellRange.End--; cellRange.Text = "T" + itemIndex + "C" + cellIndex;
+          }
+          table.Range.Cells(1).Range.Font.Bold = -1;
+          table.Range.Cells(4).Shading.BackgroundPatternColor = 16315114;
+        } else {
+          sample.Range(end, end).Text = "x+" + itemIndex;
+          sample.OMaths.Add(sample.Range(end, end + 3)).OMaths(1).BuildUp();
+          end = sample.Content.End - 1; sample.Range(end, end).Text = "\r";
+        }
+      }
+      var lastEnd = sample.Content.End - 1; sample.Range(lastEnd, lastEnd).Text = "SUFFIX\r";
+      sample.TrackRevisions = tracked;
+      var name = command + "-native-" + mode, path = fso.BuildPath(testDir, name + ".docx");
+      sample.SaveAs2(path); sample.Close(false); sample = word.Documents.Open(path); sample.Activate();
+      if (kind === 1 && mode === 0) sample.ExportAsFixedFormat(fso.BuildPath(testDir, name + "-before.pdf"), 17);
+      var before = unaffectedState(sample, collectionName, 3), targetRange = sample[collectionName](2).Range;
+      var prefix = String(sample.Range(0, targetRange.Start).Text), suffix = String(sample.Range(targetRange.End, sample.Content.End).Text);
+      var beforeText = String(sample.Content.Text), beforeRevisions = Number(sample.Revisions.Count);
+      var guard = kind === 0 ? runJson(["tables", "--table", "2"], name + "-before.json").tables[0].fingerprint
+        : runJson(["equations", "--index", "2"], name + "-before.json").equations[0].fingerprint;
+      var savedBefore = Boolean(sample.Saved), output = fso.BuildPath(testDir, name + "-result.json");
+      var args = [command, kind === 0 ? "--table" : "--index", "2", kind === 0 ? "--expect-table-fingerprint" : "--expect-equation-fingerprint",
+        guard, "--expect-path", path, "--yes", "--output", output];
+      if (kind === 0 && mode === 3) args.push("--allow-track-changes");
+      bridge = readFailure ? faultBridge : originalBridge;
+      var outcome;
+      try { outcome = execute(args); } finally { bridge = originalBridge; }
+      if (blocked) {
+        assertTrue(outcome.code !== 0 && outcome.stderr.indexOf("Track Changes") >= 0, "Tracked table deletion bypassed its preflight guard");
+        assertTrue(String(sample.Content.Text) === beforeText && Boolean(sample.Saved) === savedBefore
+          && Number(sample.Revisions.Count) === beforeRevisions, "Blocked table deletion changed the document");
+      } else {
+        var result = parseJsonFile(output), success = mode === 0;
+        assertTrue(outcome.code === (success ? 0 : 3) && result.ok === success && result.verified === success
+          && result.inspection_complete === success && result.applied === true && result.fingerprint === null,
+          "Deletion result did not distinguish the returned write from confirmed removal");
+        assertTrue(String(result.document.path).toLowerCase() === path.toLowerCase() && result.track_revisions === tracked,
+          "Deletion result lost document identity or revision policy");
+        assertTrue(result[kind === 0 ? "remaining_tables" : "remaining_equations"] === (readFailure ? null : tracked ? 3 : 2)
+          && result.readback.expected_remaining === 2 && result.readback.matches_requested === (readFailure ? null : !tracked),
+          "Deletion result disagreed with native object counts");
+        assertTrue((result.errors.length === 0) === success, "Deletion verification lost its errors");
+        if (kind === 1) assertTrue(result.deleted_units > 0 && result.prepared_inline === !tracked, "Native deletion lost its display-equation preparation state");
+      }
+      var expectedCount = tracked ? 3 : 2;
+      assertTrue(Number(sample[collectionName].Count) === expectedCount, "Deletion affected a different number of objects");
+      assertTrue(unaffectedState(sample, collectionName, tracked ? 3 : 2) === before, "Deletion changed surviving objects, formatting, stories or bookmarks");
+      if (tracked) {
+        var retained = sample[collectionName](2).Range;
+        assertTrue(String(sample.Range(0, retained.Start).Text) === prefix && String(sample.Range(retained.End, sample.Content.End).Text) === suffix,
+          "Tracked deletion changed neighboring text");
+        if (!blocked) assertTrue(Number(sample.Revisions.Count) > beforeRevisions, "Tracked deletion lost its review history");
+      } else assertTrue(String(sample.Content.Text) === prefix + suffix, "Deletion removed neighboring text");
+      var afterText = String(sample.Content.Text), afterRevisions = Number(sample.Revisions.Count);
+      sample.Save(); sample.Close(false); sample = word.Documents.Open(path); sample.Activate();
+      assertTrue(Number(sample[collectionName].Count) === expectedCount && Number(sample.Revisions.Count) === afterRevisions
+        && String(sample.Content.Text) === afterText && unaffectedState(sample, collectionName, tracked ? 3 : 2) === before,
+        "Deletion state or unaffected content changed after save and reopen");
+      if (kind === 1 && mode === 0) sample.ExportAsFixedFormat(fso.BuildPath(testDir, name + "-after.pdf"), 17);
+    } finally { bridge = originalBridge; sample.Close(false); doc.Activate(); }
+  }
+}
+
 function exerciseXmlNormalization() {
   // Exercise the shipped normalizer in real MSXML, without substituting a different XML parser.
   var source = readUtf8(bridge);
@@ -557,7 +670,7 @@ var word = null;
 var doc = null;
 var failure = null;
 var savedWordOptions = {};
-var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"cell_text_fidelity":true,"verified_cell_results":true,"verified_structure_results":true,"backup":true,"pdf":true,"close":true}';
+var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"cell_text_fidelity":true,"verified_cell_results":true,"verified_structure_results":true,"verified_deletion_results":true,"backup":true,"pdf":true,"close":true}';
 
 function exerciseScopedInspection() {
   var queryDoc = word.Documents.Add();
@@ -807,7 +920,7 @@ function runFixture(path) {
     "delete-table", "--table", String(testTableIndex), "--expect-table-fingerprint", advancedTableFingerprint,
     "--expect-path", path, "--yes"
   ], "fixture-delete-table.json");
-  assertTrue(deletedTable.ok && deletedTable.remaining_tables === tableCount, "fixture table cleanup failed");
+  assertTrue(deletedTable.ok && deletedTable.verified && deletedTable.readback.matches_requested && deletedTable.remaining_tables === tableCount, "fixture table cleanup failed");
 
   var insertedEquation = runJson([
     "insert-equation", "--input", equationInput, "--format", "latex", "--at", "end",
@@ -823,7 +936,7 @@ function runFixture(path) {
     "delete-equation", "--index", String(testEquationIndex), "--expect-equation-fingerprint", String(setEquation.fingerprint),
     "--expect-path", path, "--yes"
   ], "fixture-delete-equation.json");
-  assertTrue(deletedEquation.ok && deletedEquation.remaining_equations === equationCount, "fixture equation cleanup failed");
+  assertTrue(deletedEquation.ok && deletedEquation.verified && deletedEquation.readback.matches_requested && deletedEquation.remaining_equations === equationCount, "fixture equation cleanup failed");
 
   var unsavedBackupPath = fso.BuildPath(testDir, "fixture-unsaved-copy" + fixtureExtension);
   var unsavedBackupResult = execute([
@@ -914,6 +1027,7 @@ try {
   exerciseCellTextFidelity();
   exerciseVerifiedCellResults();
   exerciseStructureResults();
+  exerciseDeletionResults();
 
   word.Selection.SetRange(0, 4);
   runJson(["paragraphs"], "control-character-paragraphs.json");
@@ -970,7 +1084,7 @@ try {
     "delete-table", "--table", "1", "--expect-table-fingerprint", advancedTableFingerprint,
     "--expect-path", docPath, "--yes"
   ], "delete-table.json");
-  assertTrue(deletedTable.ok && deletedTable.remaining_tables === 0, "guarded table deletion failed");
+  assertTrue(deletedTable.ok && deletedTable.verified && deletedTable.readback.matches_requested && deletedTable.remaining_tables === 0, "guarded table deletion failed");
 
   var insertedEquation = runJson([
     "insert-equation", "--input", equationInput, "--format", "latex", "--at", "end",
@@ -997,7 +1111,7 @@ try {
     "delete-equation", "--index", "1", "--expect-equation-fingerprint", String(setEquation.fingerprint),
     "--expect-path", docPath, "--yes"
   ], "delete-equation.json");
-  assertTrue(deletedEquation.ok && deletedEquation.remaining_equations === 0, "guarded equation deletion failed");
+  assertTrue(deletedEquation.ok && deletedEquation.verified && deletedEquation.readback.matches_requested && deletedEquation.remaining_equations === 0, "guarded equation deletion failed");
 
   exerciseScopedInspection();
 

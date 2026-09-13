@@ -187,7 +187,7 @@ try {
         }
         $integration = $integrationText | ConvertFrom-Json
         if (-not $integration.ok -or -not $integration.advanced_tables -or -not $integration.scoped_inspection -or -not $integration.cell_text_fidelity -or
-            -not $integration.verified_cell_results -or -not $integration.verified_structure_results) {
+            -not $integration.verified_cell_results -or -not $integration.verified_structure_results -or -not $integration.verified_deletion_results) {
             throw 'isolated command integration returned an unsuccessful result'
         }
         $commandIntegration = 'passed'
@@ -287,6 +287,7 @@ try {
         cell_text_fidelity = $commandIntegration
         verified_cell_results = $commandIntegration
         verified_structure_results = $commandIntegration
+        verified_deletion_results = $commandIntegration
         save_output_guards = $saveOutputGuards
         fixture_document = $fixtureDocument
     } | ConvertTo-Json -Compress -Depth 5

@@ -978,4 +978,75 @@ test('Row and column results retain completed or uncertain writes through failed
   } finally { Object.assign(context, original); }
 });
 
+test('Object deletion blocks tracked table writes and preserves uncertain or incomplete removal results', () => {
+  const original = { getWord: context.getWord, tableFingerprint: context.tableFingerprint, equationFingerprint: context.equationFingerprint, emit: context.emit };
+  try {
+    for (const kind of ['table', 'equation']) {
+      for (const mode of ['success', 'tracked-blocked', 'tracked-retained', 'no-removal', 'readback-throw', 'invalid-count', 'write-throw', 'write-and-readback', 'zero-return',
+        'display-success', 'display-prepare-throw', 'display-prepare-silent', 'display-delete-throw']) {
+        if (mode === 'tracked-blocked' && kind !== 'table' || (mode === 'zero-return' || mode.startsWith('display-')) && kind !== 'equation') continue;
+        let count = 3, writes = 0, inspections = 0, preparationWrites = 0, equationType = mode.startsWith('display-') ? 0 : 1, result;
+        const preparationFailed = mode.startsWith('display-prepare-');
+        const writeThrew = ['write-throw', 'write-and-readback', 'display-delete-throw'].includes(mode);
+        const success = mode === 'success' || mode === 'display-success';
+        function remove() {
+          writes++;
+          if (!['tracked-retained', 'no-removal', 'zero-return'].includes(mode)) count--;
+          if (writeThrew) throw new Error('Deletion interrupted');
+          return mode === 'zero-return' ? 0 : 1;
+        }
+        const target = kind === 'table' ? { Delete: remove } : { Range: { Delete: remove },
+          get Type() { return equationType; }, set Type(value) {
+            preparationWrites++;
+            if (mode !== 'display-prepare-silent') equationType = value;
+            if (mode === 'display-prepare-throw') throw new Error('Inline preparation interrupted');
+          } };
+        const collection = index => { assert.equal(index, 2); return target; };
+        Object.defineProperty(collection, 'Count', { get() {
+          if (writes && (mode === 'readback-throw' || mode === 'write-and-readback')) throw new Error('Collection unreadable');
+          return writes && mode === 'invalid-count' ? NaN : count;
+        } });
+        const tracked = mode.startsWith('tracked-');
+        const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', TrackRevisions: tracked,
+          [kind === 'table' ? 'Tables' : 'OMaths']: collection };
+        context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+        context.tableFingerprint = context.equationFingerprint = () => { inspections++; return 'before'; };
+        context.emit = text => { result = JSON.parse(text); }; context.lastError = '';
+        context.ARGS = ['delete-' + kind, kind === 'table' ? '--table' : '--index', '2',
+          '--expect-' + kind + '-fingerprint', 'before', '--expect-path', doc.FullName, '--yes'];
+        if (mode === 'tracked-retained' && kind === 'table') context.ARGS.push('--allow-track-changes');
+        const run = () => kind === 'table' ? context.commandDeleteTable() : context.commandDeleteEquation();
+        if (mode === 'tracked-blocked') {
+          assert.throws(run, /Track Changes/);
+          assert.equal(writes, 0); assert.equal(result, undefined); assert.equal(count, 3);
+          continue;
+        }
+        if (success) run(); else assert.throws(run, /Exit 3/);
+        const unknownCount = ['readback-throw', 'invalid-count', 'write-and-readback'].includes(mode);
+        assert.equal(result.ok, success); assert.equal(result.verified, success);
+        assert.equal(result.inspection_complete, success); assert.equal(result.fingerprint, null);
+        assert.equal(result.applied, writeThrew || preparationFailed ? null : mode !== 'zero-return');
+        assert.equal(result[kind === 'table' ? 'remaining_tables' : 'remaining_equations'], unknownCount ? null : count);
+        assert.equal(result.readback.expected_remaining, 2);
+        assert.equal(result.readback.matches_requested, unknownCount ? null : count === 2);
+        assert.equal(result.document.path, doc.FullName); assert.equal(result.track_revisions, tracked);
+        assert.equal(result[kind === 'table' ? 'table' : 'index'], 2);
+        assert.equal(result.errors.length === 0, success);
+        if (mode === 'write-and-readback') {
+          assert.ok(result.errors.some(error => error.includes('Deletion interrupted')));
+          assert.ok(result.errors.some(error => error.includes('Collection unreadable')));
+        }
+        if (kind === 'equation') {
+          assert.equal(result.deleted_units, writeThrew || preparationFailed ? null : mode === 'zero-return' ? 0 : 1);
+          assert.equal(result.prepared_inline, preparationFailed ? null : mode.startsWith('display-'));
+        }
+        assert.equal(preparationWrites, mode.startsWith('display-') ? 1 : 0);
+        assert.equal(writes, preparationFailed ? 0 : 1, 'Never delete after failed preparation or replay a deletion');
+        assert.equal(inspections, 1, 'Inspect the target before deletion, without fingerprinting a removed object');
+        assert.equal(doc.TrackRevisions, tracked, 'Deletion must not change revision policy');
+      }
+    }
+  } finally { Object.assign(context, original); }
+});
+
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));

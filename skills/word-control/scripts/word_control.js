@@ -1653,21 +1653,45 @@ function commandSetBorders(scope) {
   emit(payload);
 }
 
+function emitDeletionResult(doc, collectionName, contextJson, countBefore, applied, errors) {
+  var remaining = null;
+  try {
+    var afterCount = Number(doc[collectionName].Count);
+    if (!isFinite(afterCount) || afterCount < 0 || afterCount !== Math.floor(afterCount)) throw new Error("invalid remaining object count");
+    remaining = afterCount;
+  } catch (e) { errors.push("readback:" + (e.message || String(e))); }
+  var expected = countBefore - 1, matches = remaining === null ? null : remaining === expected;
+  if (matches === false) errors.push("readback:object count did not decrease by one; inspect the target and any pending revisions before retrying");
+  var verified = applied === true && matches === true && errors.length === 0;
+  var countName = collectionName === "Tables" ? "remaining_tables" : "remaining_equations";
+  var payload = "{\"ok\":" + boolJson(verified) + "," + contextJson + ",\"" + countName + "\":" + (remaining === null ? "null" : remaining)
+    + ",\"applied\":" + (applied === null ? "null" : boolJson(applied)) + ",\"verified\":" + boolJson(verified)
+    + ",\"inspection_complete\":" + boolJson(verified) + ",\"readback\":{\"expected_remaining\":" + expected
+    + ",\"matches_requested\":" + (matches === null ? "null" : boolJson(matches)) + "}"
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":null}";
+  if (!verified) failJson(payload, 3);
+  emit(payload);
+}
+
 function commandDeleteTable() {
   requireYes();
   var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
   var word = getWord();
   var doc = getMutationDocument(word);
+  requireTableTrackChangesOff(doc, "delete-table");
   var tableCount = Number(doc.Tables.Count);
+  if (!isFinite(tableCount) || tableCount < 0 || tableCount !== Math.floor(tableCount)) die("invalid table count before deletion");
   if (tableIndex > tableCount) die("table index out of range; document has " + tableCount + " tables");
   var table = doc.Tables(tableIndex);
   requireFingerprint(tableFingerprint(table), "--expect-table-fingerprint", "--allow-unverified-target");
+  var contextJson = "\"action\":\"delete-table\",\"table\":" + tableIndex + ",\"track_revisions\":" + boolJson(Boolean(doc.TrackRevisions))
+    + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, errors = [];
   try {
     table.Delete();
-  } catch (e) {
-    die("failed to delete table: " + e.message);
-  }
-  emit("{\"ok\":true,\"action\":\"delete-table\",\"remaining_tables\":" + Number(doc.Tables.Count) + "}");
+    applied = true;
+  } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitDeletionResult(doc, "Tables", contextJson, tableCount, applied, errors);
 }
 
 function commandNormalizeTableBorders() {
@@ -1770,14 +1794,33 @@ function commandDeleteEquation() {
   var word = getWord();
   var doc = getMutationDocument(word);
   var count = Number(doc.OMaths.Count);
+  if (!isFinite(count) || count < 0 || count !== Math.floor(count)) die("invalid equation count before deletion");
   if (idx > count) die("equation index out of range; document has " + count + " equations");
-  requireFingerprint(equationFingerprint(doc.OMaths(idx)), "--expect-equation-fingerprint", "--allow-unverified-target");
-  try {
-    doc.OMaths(idx).Range.Delete();
-  } catch (e) {
-    die("failed to delete equation: " + e.message);
+  var equation = doc.OMaths(idx);
+  requireFingerprint(equationFingerprint(equation), "--expect-equation-fingerprint", "--allow-unverified-target");
+  var tracked = Boolean(doc.TrackRevisions);
+  var contextJson = "\"action\":\"delete-equation\",\"index\":" + idx + ",\"track_revisions\":" + boolJson(tracked)
+    + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var prepareInline = !tracked && Number(equation.Type) === 0;
+  var applied = null, deletedUnits = null, preparedInline = false, errors = [];
+  if (prepareInline) {
+    // A display equation can leave an empty OMath at its paragraph mark after Range.Delete.
+    preparedInline = null;
+    try {
+      equation.Type = 1; // wdOMathInline; keep tracked revision objects in their original form.
+      if (Number(equation.Type) !== 1) throw new Error("equation did not become inline before deletion");
+      preparedInline = true;
+    } catch (prepareError) { errors.push("prepare:" + (prepareError.message || String(prepareError))); }
   }
-  emit("{\"ok\":true,\"action\":\"delete-equation\",\"remaining_equations\":" + Number(doc.OMaths.Count) + "}");
+  if (preparedInline !== null) try {
+    var reportedUnits = Number(equation.Range.Delete());
+    if (!isFinite(reportedUnits) || reportedUnits < 0 || reportedUnits !== Math.floor(reportedUnits)) throw new Error("Range.Delete returned an invalid deletion count");
+    deletedUnits = reportedUnits;
+    applied = deletedUnits > 0;
+    if (!applied) errors.push("write:Range.Delete returned 0; deletion was not reported as successful");
+  } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitDeletionResult(doc, "OMaths", contextJson + ",\"deleted_units\":" + (deletedUnits === null ? "null" : deletedUnits)
+    + ",\"prepared_inline\":" + (preparedInline === null ? "null" : boolJson(preparedInline)), count, applied, errors);
 }
 
 function confirmSavedDocument(word, doc) {
