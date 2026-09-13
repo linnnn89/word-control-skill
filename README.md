@@ -6,7 +6,7 @@ Word Control is a Codex skill for narrow, in-place editing of the active Microso
 
 Typical tasks include:
 
-- inspect the active document, selection, paragraphs, tables, and equations, with paragraph pages and targeted/full-text/summary table queries;
+- inspect the active document and selection, find literal text in the main story or notes, and read paragraph/cell pages or targeted tables/equations;
 - replace selected text, add comments, and make tracked changes;
 - edit table cells, swap cell contents, add or remove rows and columns, and change borders or shading;
 - insert, replace, and remove Word equations from supported LaTeX or linear input;
@@ -20,7 +20,7 @@ Word Control 是一个面向 Windows 桌面版 Microsoft Word 的 Codex 技能�
 
 主要能力包括：
 
-- 检查当前文档、选区、段落、表格和公式，支持段落分页、指定单表、表格文本及结构摘要；
+- 检查当前文档和选区，定位正文、脚注或尾注中的文字，按需读取段落、单元格分页及指定表格或公式；
 - 替换选中文字、添加批注和使用修订模式修改；
 - 精细修改表格单元格，交换内容，增删行列，更改边框和底色；
 - 根据受支持的 LaTeX 或线性输入插入、替换和删除 Word 内置公式；
@@ -77,12 +77,18 @@ cscript //nologo $wc tables --detail summary --output tables-summary.json
 cscript //nologo $wc tables --detail text --output tables-text.json
 cscript //nologo $wc tables --table 2 --output table-2.json
 cscript //nologo $wc paragraphs --from 81 --max 40 --output paragraphs-81.json
-cscript //nologo $wc equations --output equations.json
+cscript //nologo $wc find-text --input query.txt --max 5 --output matches.json
+cscript //nologo $wc tables --table 2 --detail text --cell-from 5 --cell-max 10 --output cells.json
+cscript //nologo $wc equations --index 1 --output equation-1.json
 ```
 
 Choose a table index from the current summary; `2` above is an example. `--table N` inspects only that table and cannot be combined with `--max`. Full detail remains the default. Summary mode reads dimensions and cell counts without reading cell text or formatting; it deliberately returns a null fingerprint, `inspection_complete:false` and an unverified layout. Obtain a full inspection of the target before editing.
 
 Use `--detail text` to read table values without the expensive format fingerprint pass. It preserves regular and merged-cell text output, with `fingerprint:null` and `inspection_complete:false`. Summary and text modes cannot authorize mutations; use full detail for that step.
+
+Cell pagination requires a single table and text detail. It returns absolute linear cell indices, the table's whole cell count and `next_cell`; it does not assume a rectangular layout. `find-text` searches case-sensitive literal input from a UTF-8 file without a trailing newline. Choose `--story main`, `footnotes` or `endnotes`, and use bounded `--max`/`--context` plus `next_from` to continue. Results identify the searched story; they do not claim header/footer/text-box coverage or provide mutation guards. Search preserves the selection and the Find settings it changes. See the command guide for limits and partial-failure semantics.
+
+`set-cell` now verifies actual cell text and returns `applied`, `verified`, `readback`, document identity and a full post-write fingerprint. A verified result can supply the next operation's expected fingerprint without an extra full query; the next write still compares it against a newly computed live fingerprint. A failed write/verification returns a nonzero exit and no reusable fingerprint, distinguishing completed-but-unverified writes from unknown effects. Inspect before retrying. Other mutation commands keep their existing result contracts.
 
 Paragraph indices are 1-based. `--from N --max count` returns the requested page with absolute indices and `next_from` (null at the end). Starting beyond the end returns no paragraphs. Document edits can shift indices. Successful calls without the new options retain their defaults and output shapes. Failed paragraph/equation reads are marked with null text and explicit read errors; an incomplete response must not be treated as complete document evidence. Equation text and its fingerprint use one snapshot.
 

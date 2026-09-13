@@ -8,7 +8,7 @@ Ordinary commands use Windows Script Host (`cscript`), not Node.js. Tests requir
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.agents\skills\word-control\scripts\test_word_control.ps1"
 ```
 
-The test creates a unique temporary DOCX in a hidden Word instance, runs pure regressions and command integration, and strictly parses every generated JSON output. It checks targeted queries and paragraph pagination, summary/text modes without mutation guards, partial-read errors, consistent equation snapshots, guarded text/table/equation edits, backups, PDF export and cleanup. It removes its own temporary artifacts.
+The test creates a unique temporary DOCX in a hidden Word instance, runs pure regressions and command integration, and strictly parses every generated JSON output. It checks paragraph/cell pagination, literal search in main text and notes with Find-setting restoration, targeted equations, summary/text modes without mutation guards, partial-read errors, verified cell writes, guarded text/table/equation edits, backups, PDF export and cleanup. It removes its own temporary artifacts.
 
 An existing Word session causes command integration to be skipped. `skipped-existing-word-session` is not complete validation and does not authorize synchronization. Never attach tests to or close the user's Word session. Run real command integration when Word is not already running, and confirm task-owned Word processes exit.
 

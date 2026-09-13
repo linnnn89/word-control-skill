@@ -119,6 +119,9 @@ function exerciseAdvancedTable(path, tableIndex, fingerprint, prefix) {
     "set-cell", "--table", String(tableIndex), "--expect-table-fingerprint", String(fingerprint),
     "--row", "2", "--col", "2", "--input", cellInput, "--expect-path", path, "--yes"
   ], prefix + "-advanced-set-cell.json");
+  assertTrue(setCell.applied === true && setCell.verified === true && setCell.inspection_complete === true, "set-cell did not verify the write");
+  assertTrue(setCell.readback.matches_requested === true && setCell.readback.chars === 6, "set-cell readback did not match CENTER");
+  assertTrue(String(setCell.document.path).toLowerCase() === path.toLowerCase(), "set-cell result lost document identity");
   requireFailure([
     "swap-cell-text", "--table", String(tableIndex), "--expect-table-fingerprint", String(fingerprint),
     "--from-row", "1", "--from-col", "1", "--to-row", "1", "--to-col", "3", "--expect-path", path, "--yes"
@@ -203,8 +206,11 @@ var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,
 
 function exerciseScopedInspection() {
   var queryDoc = word.Documents.Add();
+  var originalFind = {}, queryFinder = null;
   try {
-    queryDoc.Content.Text = "first\r\u7b2c\u4e8c\u6bb5\rthird\rfourth\rfifth\rsixth\r";
+    queryDoc.Content.Text = "first\r\u7b2c\u4e8c\u6bb5\rthird\rfourth\rfifth\rsixth\r\uff4e\uff45\uff45\uff44\uff4c\uff45 needle ^p needle Needle\r";
+    queryDoc.Footnotes.Add(queryDoc.Range(1, 1)).Range.Text = "needle footnote";
+    queryDoc.Endnotes.Add(queryDoc.Range(3, 3)).Range.Text = "needle endnote";
     queryDoc.Tables.Add(queryDoc.Range(queryDoc.Content.End - 1, queryDoc.Content.End - 1), 2, 2);
     queryDoc.Content.InsertAfter("\r");
     var queryTable = queryDoc.Tables.Add(queryDoc.Range(queryDoc.Content.End - 1, queryDoc.Content.End - 1), 3, 3);
@@ -214,6 +220,9 @@ function exerciseScopedInspection() {
       cellRange.Text = "DETAIL_" + c + " " + new Array(30).join("sample text ");
     }
     queryTable.Cell(1, 1).Merge(queryTable.Cell(1, 2));
+    var mathStart = Number(queryDoc.Content.End) - 1;
+    queryDoc.Range(mathStart, mathStart).Text = "x+1";
+    queryDoc.OMaths.Add(queryDoc.Range(mathStart, mathStart + 3)).OMaths(1).BuildUp();
     var queryPath = fso.BuildPath(testDir, "scoped-inspection.docx");
     try { queryDoc.SaveAs2(queryPath); } catch (saveError) { queryDoc.SaveAs(queryPath); }
     queryDoc.Activate();
@@ -222,6 +231,29 @@ function exerciseScopedInspection() {
     var selectionStart = Number(word.Selection.Start);
     var selectionEnd = Number(word.Selection.End);
     var savedBefore = Boolean(queryDoc.Saved);
+
+    queryFinder = queryDoc.Content.Find;
+    var findNames = ["Text", "MatchCase", "MatchWholeWord", "MatchWildcards", "Forward", "Wrap", "Format"];
+    for (var setting = 0; setting < findNames.length; setting++) originalFind[findNames[setting]] = queryFinder[findNames[setting]];
+    queryFinder.Text = "user query"; queryFinder.MatchCase = false; queryFinder.Wrap = 1;
+    queryFinder.MatchWholeWord = true; queryFinder.MatchWildcards = true; queryFinder.Forward = false;
+    var configuredFind = {};
+    for (var setting = 0; setting < findNames.length; setting++) configuredFind[findNames[setting]] = queryFinder[findNames[setting]];
+    var findInput = fso.BuildPath(testDir, "find-query.txt");
+    writeUtf8(findInput, "needle");
+    var firstHit = runJson(["find-text", "--input", findInput, "--max", "1", "--context", "2"], "find-first.json");
+    assertTrue(firstHit.returned === 1 && firstHit.has_more === true && firstHit.story_type === 1, "find did not bound the first page");
+    assertTrue(firstHit.matches[0].start === textBefore.indexOf("needle"), "find returned the wrong Word position");
+    var secondHit = runJson(["find-text", "--input", findInput, "--from", String(firstHit.next_from)], "find-next.json");
+    assertTrue(secondHit.returned === 1 && secondHit.has_more === false && secondHit.next_from === null, "find pagination repeated a match or ignored case");
+    assertTrue(secondHit.matches[0].start > firstHit.matches[0].end, "find did not advance");
+    var noteHit = runJson(["find-text", "--input", findInput, "--story", "endnotes"], "find-endnotes.json");
+    var footHit = runJson(["find-text", "--input", findInput, "--story", "footnotes"], "find-footnotes.json");
+    assertTrue(noteHit.returned === 1 && noteHit.story_type === 3 && footHit.returned === 1 && footHit.story_type === 2, "find lost note coverage");
+    writeUtf8(findInput, "^p");
+    var literalHit = runJson(["find-text", "--input", findInput], "find-literal.json");
+    assertTrue(literalHit.returned === 1 && literalHit.matches[0].text === "^p", "find interpreted literal text as a Word special code");
+    for (var setting = 0; setting < findNames.length; setting++) assertTrue(queryFinder[findNames[setting]] === configuredFind[findNames[setting]], "find changed user option: " + findNames[setting]);
 
     var page = runJson(["paragraphs", "--from", "2", "--max", "2"], "scoped-paragraphs.json");
     assertTrue(page.returned === 2 && page.from === 2 && page.next_from === 4, "paragraph pagination metadata mismatch");
@@ -236,6 +268,13 @@ function exerciseScopedInspection() {
     assertTrue(target.tables[0].index === 2 && target.tables[0].fingerprint === all.tables[1].fingerprint, "single-table query returned a different target");
     assertTrue(target.tables[0].layout === "irregular" && target.tables[0].linear_cells.length === 8, "targeted query lost merged-table support");
     assertTrue(target.tables[0].inspection_complete && target.tables[0].read_errors.length === 0, "targeted full inspection was incomplete");
+    var cellPage = runJson(["tables", "--table", "2", "--detail", "text", "--cell-from", "3", "--cell-max", "2"], "scoped-cell-page.json").tables[0];
+    assertTrue(cellPage.returned_cells === 2 && cellPage.next_cell === 5 && cellPage.cell_count === 8, "cell pagination lost merged-cell indices");
+    assertTrue(cellPage.fingerprint === null && cellPage.layout === "unverified", "cell page exposed an unchecked guard or layout");
+    for (var item = 0; item < 2; item++) assertTrue(cellPage.linear_cells[item].index === item + 3 && cellPage.linear_cells[item].text === target.tables[0].linear_cells[item + 2].text, "cell page returned wrong content");
+    var allEquations = runJson(["equations"], "scoped-equations.json");
+    var oneEquation = runJson(["equations", "--index", "1"], "scoped-equation.json");
+    assertTrue(oneEquation.returned === 1 && oneEquation.equations[0].fingerprint === allEquations.equations[0].fingerprint, "targeted equation differed from full inspection");
     var textOnly = runJson(["tables", "--detail", "text"], "scoped-tables-text.json");
     assertTrue(textOnly.returned === all.returned && textOnly.detail === "text", "text inspection scope mismatch");
     for (var t = 0; t < all.tables.length; t++) {
@@ -266,7 +305,18 @@ function exerciseScopedInspection() {
     assertTrue(String(queryDoc.Content.Text) === textBefore && Boolean(queryDoc.Saved) === savedBefore, "read-only inspection changed the document");
     assertTrue(Number(word.Selection.Start) === selectionStart && Number(word.Selection.End) === selectionEnd, "read-only inspection changed the selection");
     assertTrue(String(word.ActiveDocument.FullName).toLowerCase() === queryPath.toLowerCase(), "read-only inspection switched the active document");
+    var cellInput = fso.BuildPath(testDir, "verified-multiline.txt");
+    writeUtf8(cellInput, "\u4e2d\u6587\r\nsecond\n");
+    var multiline = runJson(["set-cell", "--table", "1", "--row", "1", "--col", "1", "--input", cellInput,
+      "--expect-path", queryPath, "--expect-table-fingerprint", all.tables[0].fingerprint, "--yes"], "verified-multiline.json");
+    assertTrue(multiline.verified && multiline.readback.matches_requested, "multiline receipt rejected Word newline normalization");
+    assertTrue(String(queryDoc.Tables(1).Cell(1, 1).Range.Text) === "\u4e2d\u6587\rsecond\r\r\x07", "multiline cell lost content or trailing paragraph");
+    writeUtf8(cellInput, "");
+    var emptyCell = runJson(["set-cell", "--table", "1", "--row", "1", "--col", "1", "--input", cellInput,
+      "--expect-path", queryPath, "--expect-table-fingerprint", multiline.fingerprint, "--yes"], "verified-empty-cell.json");
+    assertTrue(emptyCell.verified && emptyCell.readback.chars === 0, "empty cell was not verified");
   } finally {
+    if (queryFinder) for (var setting in originalFind) queryFinder[setting] = originalFind[setting];
     queryDoc.Close(false);
     queryDoc = null;
     doc.Activate();

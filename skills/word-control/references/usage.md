@@ -15,10 +15,12 @@ cscript //nologo $wc tables --detail summary --output tables-summary.json
 cscript //nologo $wc tables --detail text --output tables-text.json
 cscript //nologo $wc tables --table 2 --output table-2.json
 cscript //nologo $wc paragraphs --from 81 --max 40 --output paragraphs-81.json
-cscript //nologo $wc equations --output equations.json
+cscript //nologo $wc find-text --input query.txt --max 5 --context 80 --output matches.json
+cscript //nologo $wc tables --table 2 --detail text --cell-from 5 --cell-max 10 --output cells.json
+cscript //nologo $wc equations --index 1 --output equation-1.json
 ```
 
-Read-only commands are `help`, `status`, `selection`, `selection-info`, `document-text`, `paragraphs`, `tables`, `equations`, and `convert-equation`.
+Read-only commands are `help`, `status`, `selection`, `selection-info`, `document-text`, `find-text`, `paragraphs`, `tables`, `equations`, and `convert-equation`.
 
 Use the active document path returned by `status` as `<doc>`. For an unsaved document, use its exact name with `--expect-name` instead.
 
@@ -29,6 +31,16 @@ Use the active document path returned by `status` as `<doc>`. For an unsaved doc
 - `tables --detail summary` reads table dimensions and cell counts without retrieving cell text, formatting or fingerprints. It works with `--table` or `--max`. Every summary uses `fingerprint:null`, `inspection_complete:false`, `layout:"unverified"`, and empty cell arrays. Unknown dimensions/counts remain null with warnings/read errors. Counts alone do not prove that a table is rectangular.
 - `tables --detail text` reads cell contents, including `linear_cells` for irregular/merged tables, without inspecting formatting. It works with `--table` or `--max`. It intentionally returns `fingerprint:null` and `inspection_complete:false`; check `read_errors` for missing text. Use it when reading table values is the task.
 - Use `tables --table N` or explicit `--detail full` before editing. Require a complete full inspection and its fingerprint; summary/text modes cannot authorize writes.
+- `tables --table N --detail text --cell-from N --cell-max count` reads only a page of Word's linear cell collection, including merged cells. Cell indices are 1-based; defaults are 1 and 40, with at most 200 cells per page. `cell_count` is the whole table count; `returned_cells` and `next_cell` describe the page. Past the end returns an empty page. Results include document identity, use `linear_cells`, and deliberately leave layout unverified and fingerprint null. Read errors invalidate pagination evidence; resolve them before continuing. New query indices are live and can shift after edits.
+- `equations --index N` reads only that equation, retaining its absolute index and the whole `equation_count`. An out-of-range index fails. Omitting `--index` retains the existing all-equation output.
+
+### Literal text location
+
+`find-text --input query.txt` finds case-sensitive, non-overlapping literal text in the active document without selecting it. Full-width and half-width characters are distinct. The UTF-8 input must contain 1-200 characters with no control characters or final newline; `^p` is literal text, not a Word search code. This command preserves the Find settings it changes and the user's selection.
+
+Choose `--story main` (default), `footnotes`, or `endnotes`; only that story is searched. Headers, footers, text boxes and other stories are not covered. An absent note story returns `story_available:false` with no matches. Output includes document identity, `story_type`, match `start`/`end`, bounded context, `has_more`, and `next_from`. Positions are Word character positions within that story, not indices into normalized JSON text. `--from` defaults to 0; `--max` defaults to 20 and is capped at 100; `--context` defaults to 80 characters on each side and is capped at 500. A full page checks one extra match to determine `has_more`; follow `next_from` only while the document is unchanged. `inspection_complete:true` means the requested query completed, not that every story or every page of matches was returned.
+
+Search/read/Find-restoration failures return nonzero exit with `ok:false`, partial `matches`, `read_errors`, and unknown `has_more`. Search results are discovery evidence, not mutation guards. `find-text` and paged table queries optionally accept `--expect-path` or `--expect-name` to reject the wrong active document.
 
 Without the new options, successful paragraph/table limits, full-detail fields and output shapes are unchanged. Failed paragraph reads return `text:null`, with top-level `inspection_complete:false` and indexed `read_errors`; they are not empty paragraphs. Failed equation reads return `text:null`, `fingerprint:null`, `inspection_complete:false` and `read_errors` on that equation. Successful equation text and its fingerprint come from one read. Do not treat a partial response as complete document evidence; resolve the error and re-read the affected scope.
 
@@ -91,6 +103,10 @@ cscript //nologo $wc delete-table --table 1 --expect-table-fingerprint <hash> --
 ```
 
 For `create-table --at selection`, also provide the fresh selection guards. TSV input larger than the requested dimensions is rejected unless `--allow-truncate` is explicit. For merged or irregular tables, use `linear_cells[].index` with `set-cell --cell`; row and column insertion/deletion require a regular table. `swap-cell-text` moves text only, not formatting. Structural operations require Track Changes off unless `--allow-track-changes` is explicitly approved.
+
+`set-cell` additionally returns `document`, `applied`, `verified`, `inspection_complete`, `readback`, and `errors`. A verified success compares the actual cell content with the requested text (normalizing CRLF/CR/LF and excluding only Word's terminal cell marker), then returns the existing full post-write fingerprint. `readback` includes `matches_requested`, actual character count and text hash without echoing the whole cell. For a subsequent operation on this verified target, the returned fingerprint can replace a redundant full query: the next mutation still recomputes and compares the live full fingerprint. Requery when a different scope or visual inspection is needed.
+
+If a write completes but readback or formatting inspection fails, `set-cell` returns `applied:true`, `verified:false`, `fingerprint:null` and a nonzero exit. If the write itself throws, `applied:null` means its effect is unknown. Inspect the current document before retrying; neither case promises rollback or permits automatic replay. These result fields apply to `set-cell`; other commands retain their existing contracts.
 
 Border edges are `top`, `left`, `bottom`, `right`, `inside-h`, and `inside-v`; `outer` expands to the four outside edges and `all` selects every valid edge for the scope. Supported point widths are `0.25`, `0.5`, `0.75`, `1`, `1.5`, `2.25`, `3`, `4.5`, and `6`. Use `--style none` to remove selected edges. Reinspect after each change and use the new fingerprint. `layout_warnings` describe non-rectangular fallback. Fingerprint read failures produce `fingerprint:null` and `inspection_complete:false`; do not mutate from an incomplete inspection. Any `read_errors`, `failure_count`, rollback failures, or a nonzero exit mean the operation is not fully verified.
 

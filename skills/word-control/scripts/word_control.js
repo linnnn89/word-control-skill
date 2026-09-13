@@ -730,9 +730,11 @@ function commandHelp() {
     "  selection [--output file]",
     "  selection-info [--output file]",
     "  document-text [--max chars|--full] [--output file]",
+    "  find-text --input file [--story main|footnotes|endnotes] [--from position] [--max count] [--context chars] [--output file]",
     "  paragraphs [--from index] [--max count] [--output file]",
     "  tables [--table index|--max count] [--detail full|text|summary] [--output file]",
-    "  equations [--output file]",
+    "  tables --table index --detail text [--cell-from index] [--cell-max count] [--output file]",
+    "  equations [--index index] [--output file]",
     "  convert-equation --input file [--format latex|linear|word] [--output file]",
     "  enable-track-changes --expect-path file --yes",
     "  disable-track-changes --expect-path file --yes",
@@ -840,15 +842,88 @@ function commandParagraphs() {
   emit("{\"ok\":true,\"paragraph_count\":" + count + ",\"returned\":" + max + page + incomplete + ",\"paragraphs\":[" + parts.join(",") + "]}");
 }
 
+function commandFindText() {
+  var query = readUtf8(opt("--input", ""));
+  if (!query.length || query.length > 200 || /[\x00-\x1f]/.test(query)) die("find-text requires 1-200 literal characters without control characters or a trailing newline");
+  var story = opt("--story", "main");
+  var storyType = story === "main" ? 1 : (story === "footnotes" ? 2 : (story === "endnotes" ? 3 : 0));
+  if (!storyType) die("--story must be main, footnotes or endnotes");
+  var from = parseNonNegativeInt(opt("--from", "0"), "--from");
+  var max = parsePositiveInt(opt("--max", "20"), "--max");
+  var contextChars = parseNonNegativeInt(opt("--context", "80"), "--context");
+  if (!isFinite(from) || from > 2147483647 || max > 100 || contextChars > 500) die("find-text limits: --from <= 2147483647, --max <= 100, --context <= 500");
+  var word = getWord();
+  var doc = getActiveDocument(word);
+  if (hasFlag("--expect-path") || hasFlag("--expect-name")) requireExpectedDocument(doc);
+  var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var available = storyType === 1 || Number(storyType === 2 ? doc.Footnotes.Count : doc.Endnotes.Count) > 0;
+  var matches = [], errors = [], more = false, next = null, end = 0;
+  if (available) {
+    var base = (storyType === 1 ? doc.Content : doc.StoryRanges(storyType)).Duplicate;
+    var start = Number(base.Start);
+    end = Number(base.End);
+    var cursor = Math.max(start, from);
+    if (cursor < end) {
+      var range = base.Duplicate;
+      var finder = range.Find;
+      var names = ["Text", "MatchCase", "MatchWholeWord", "MatchWildcards", "MatchSoundsLike", "MatchAllWordForms", "Forward", "Wrap", "Format", "MatchByte", "MatchFuzzy", "MatchPrefix", "MatchSuffix", "IgnoreSpace", "IgnorePunct"];
+      var previous = [], changed = 0;
+      try {
+        // Read all settings before changing any; do not clear the user's formatting criteria.
+        for (var p = 0; p < names.length; p++) previous.push(finder[names[p]]);
+        for (var s = 0; s < names.length; s++) {
+          changed = s + 1;
+          finder[names[s]] = names[s] === "Text" ? query.replace(/\^/g, "^^") : (names[s] === "MatchCase" || names[s] === "MatchByte" || names[s] === "Forward" ? true : (names[s] === "Wrap" ? 0 : false));
+        }
+        while (cursor < end) {
+          range.SetRange(cursor, end);
+          if (!finder.Execute()) break;
+          var hitStart = Number(range.Start), hitEnd = Number(range.End);
+          if (hitStart < cursor || hitEnd <= hitStart || hitEnd > end || String(range.Text) !== query) throw new Error("find returned a nonliteral or out-of-scope match");
+          if (matches.length === max) { more = true; break; }
+          var excerpt = base.Duplicate;
+          excerpt.SetRange(Math.max(start, hitStart - contextChars), Math.min(end, hitEnd + contextChars));
+          var excerptText = normalizeText(excerpt.Text);
+          var textLimit = query.length + contextChars * 2;
+          matches.push("{\"start\":" + hitStart + ",\"end\":" + hitEnd + ",\"text\":" + q(query)
+            + ",\"context\":" + q(excerptText.substring(0, textLimit)) + ",\"context_truncated\":" + boolJson(excerptText.length > textLimit) + "}");
+          cursor = hitEnd;
+          next = cursor;
+        }
+      } catch (e) { errors.push("find:" + (e.message || String(e))); }
+      finally {
+        for (var restore = changed - 1; restore >= 0; restore--) {
+          try { finder[names[restore]] = previous[restore]; }
+          catch (restoreError) { errors.push("restore-find-" + names[restore] + ":" + (restoreError.message || String(restoreError))); }
+        }
+      }
+    }
+  }
+  var payload = "{\"ok\":" + boolJson(errors.length === 0) + ",\"document\":" + documentJson
+    + ",\"story\":" + q(story) + ",\"story_type\":" + storyType + ",\"story_available\":" + boolJson(available)
+    + ",\"from\":" + from + ",\"story_end\":" + end + ",\"returned\":" + matches.length
+    + ",\"has_more\":" + (errors.length ? "null" : boolJson(more)) + ",\"next_from\":" + (more && !errors.length ? next : "null")
+    + ",\"inspection_complete\":" + boolJson(errors.length === 0) + ",\"read_errors\":" + stringArrayJson(errors)
+    + ",\"matches\":[" + matches.join(",") + "]}";
+  if (errors.length) failJson(payload, 3);
+  emit(payload);
+}
+
 function commandTables() {
   var tableText = opt("--table", "");
   var maxText = opt("--max", "");
   if (tableText && maxText) die("use either --table or --max, not both");
   var detail = opt("--detail", "full");
   if (detail !== "full" && detail !== "text" && detail !== "summary") die("--detail must be full, text or summary");
+  var cellPage = hasFlag("--cell-from") || hasFlag("--cell-max");
+  if (cellPage && (!tableText || detail !== "text")) die("cell pagination requires --table and --detail text");
+  var cellFrom = cellPage ? parsePositiveInt(opt("--cell-from", "1"), "--cell-from") : 1;
+  var cellMax = cellPage ? parsePositiveInt(opt("--cell-max", "40"), "--cell-max") : 0;
+  if (cellPage && (!isFinite(cellFrom) || cellMax > 200)) die("cell pagination requires a finite index and --cell-max <= 200");
   var first = tableText ? parsePositiveInt(tableText, "--table") : 1;
   var word = getWord();
   var doc = getActiveDocument(word);
+  if (cellPage && (hasFlag("--expect-path") || hasFlag("--expect-name"))) requireExpectedDocument(doc);
   var tables = doc.Tables;
   var count = Number(tables.Count);
   if (tableText && first > count) die("table index out of range; document has " + count + " tables");
@@ -881,7 +956,7 @@ function commandTables() {
     var cells = [];
     var linearCells = [];
     var cellCount = 0;
-    var rectangular = rowCountKnown && colCountKnown && rowCount > 0 && colCount > 0;
+    var rectangular = !cellPage && rowCountKnown && colCountKnown && rowCount > 0 && colCount > 0;
     var rectangleFailed = false;
     if (rectangular) {
       for (var r = 1; r <= rowCount && !rectangleFailed; r++) {
@@ -906,9 +981,11 @@ function commandTables() {
       cellCount = rowCount * colCount;
     } else {
       try {
-        cellCount = Number(table.Range.Cells.Count);
-        for (var k = 1; k <= cellCount; k++) {
-          var cell = table.Range.Cells(k);
+        var nativeCells = table.Range.Cells;
+        cellCount = Number(nativeCells.Count);
+        var cellEnd = cellPage ? Math.min(cellCount, cellFrom + cellMax - 1) : cellCount;
+        for (var k = cellFrom; k <= cellEnd; k++) {
+          var cell = nativeCells(k);
           var rowJson = "null";
           var colJson = "null";
           var textJson = "null";
@@ -924,26 +1001,34 @@ function commandTables() {
     // Text-only inspection never supplies a guard; mutations still need full formatting reads.
     var fingerprint = detail === "full" ? tableFingerprint(table, readErrors) : null;
     parts.push(tableInfo
-      + ",\"layout\":" + q(rectangular ? "rectangular" : "irregular")
+      + ",\"layout\":" + q(cellPage ? "unverified" : (rectangular ? "rectangular" : "irregular"))
       + ",\"cell_count\":" + cellCount
       + ",\"fingerprint\":" + (fingerprint === null ? "null" : q(fingerprint))
       + ",\"inspection_complete\":" + boolJson(detail === "full" && readErrors.length === 0)
       + ",\"layout_warnings\":" + stringArrayJson(layoutWarnings)
       + ",\"read_errors\":" + stringArrayJson(readErrors)
       + ",\"cells\":[" + cells.join(",") + "]"
-      + ",\"linear_cells\":[" + linearCells.join(",") + "]}");
+      + ",\"linear_cells\":[" + linearCells.join(",") + "]"
+      + (cellPage ? ",\"cell_from\":" + cellFrom + ",\"returned_cells\":" + linearCells.length
+        + ",\"next_cell\":" + (!readErrors.length && linearCells.length && cellFrom + linearCells.length <= cellCount ? cellFrom + linearCells.length : "null") : "") + "}");
   }
   var detailPart = hasFlag("--detail") ? ",\"detail\":" + q(detail) : "";
-  emit("{\"ok\":true,\"table_count\":" + count + ",\"returned\":" + returned + detailPart + ",\"tables\":[" + parts.join(",") + "]}");
+  emit("{\"ok\":true,\"table_count\":" + count + ",\"returned\":" + returned + detailPart
+    + (cellPage ? ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}" : "")
+    + ",\"tables\":[" + parts.join(",") + "]}");
 }
 
 function commandEquations() {
+  var indexText = opt("--index", "");
+  var first = indexText ? parsePositiveInt(indexText, "--index") : 1;
   var word = getWord();
   var doc = getActiveDocument(word);
   var equations = doc.OMaths;
   var count = Number(equations.Count);
+  if (indexText && first > count) die("equation index out of range; document has " + count + " equations");
+  var end = indexText ? first : count;
   var parts = [];
-  for (var i = 1; i <= count; i++) {
+  for (var i = first; i <= end; i++) {
     var text = null;
     var fingerprint = null;
     var readErrors = [];
@@ -955,7 +1040,7 @@ function commandEquations() {
     parts.push("{\"index\":" + i + ",\"text\":" + (text === null ? "null" : q(text))
       + ",\"fingerprint\":" + (fingerprint === null ? "null" : q(fingerprint)) + incomplete + "}");
   }
-  emit("{\"ok\":true,\"equation_count\":" + count + ",\"equations\":[" + parts.join(",") + "]}");
+  emit("{\"ok\":true,\"equation_count\":" + count + (indexText ? ",\"returned\":1" : "") + ",\"equations\":[" + parts.join(",") + "]}");
 }
 
 function commandTrack(on) {
@@ -1076,14 +1161,31 @@ function commandSetCell() {
     if (col > colCount) die("column index out of range; table has " + colCount + " columns");
     targetCell = table.Cell(row, col);
   }
-  try {
-    setCellText(targetCell, text);
-  } catch (e3) {
-    die("failed to set cell: " + e3.message);
+  var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = false, verified = false, fingerprint = null, readback = "null", errors = [];
+  try { setCellText(targetCell, text); applied = true; }
+  catch (e3) { applied = null; errors.push("write:" + (e3.message || String(e3))); }
+  if (applied === true) {
+    try {
+      var raw = String(targetCell.Range.Text);
+      if (!/\r\x07$/.test(raw)) throw new Error("cell terminator was not readable");
+      var actual = normalizeText(raw.substring(0, raw.length - 2));
+      var matches = actual === normalizeText(text.replace(/\r\n/g, "\n"));
+      readback = "{\"matches_requested\":" + boolJson(matches) + ",\"chars\":" + actual.length + ",\"text_hash\":" + q(textHash(actual)) + "}";
+      if (!matches) errors.push("readback:cell text differs from requested text");
+    } catch (readError) { errors.push("readback:" + (readError.message || String(readError))); }
+    try { fingerprint = tableFingerprint(table, errors); }
+    catch (fingerprintError) { errors.push("fingerprint:" + (fingerprintError.message || String(fingerprintError))); }
+    verified = errors.length === 0 && fingerprint !== null;
   }
-  emit("{\"ok\":true,\"action\":\"set-cell\",\"table\":" + tableIndex
+  // An interrupted write may already have changed the document. Never return a retry guard.
+  var payload = "{\"ok\":" + boolJson(verified) + ",\"action\":\"set-cell\",\"table\":" + tableIndex
     + ",\"cell\":" + (cellIndex || "null") + ",\"row\":" + (row || "null") + ",\"col\":" + (col || "null")
-    + ",\"chars\":" + text.length + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    + ",\"chars\":" + text.length + ",\"document\":" + documentJson + ",\"applied\":" + (applied === null ? "null" : boolJson(applied))
+    + ",\"verified\":" + boolJson(verified) + ",\"inspection_complete\":" + boolJson(verified) + ",\"readback\":" + readback
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
+  emit(payload);
 }
 
 function getGuardedTable(doc, tableIndex) {
@@ -1568,6 +1670,7 @@ try {
   else if (COMMAND === "selection-info") commandSelectionInfo();
   else if (COMMAND === "document-text") commandDocumentText();
   else if (COMMAND === "paragraphs") commandParagraphs();
+  else if (COMMAND === "find-text") commandFindText();
   else if (COMMAND === "tables") commandTables();
   else if (COMMAND === "equations") commandEquations();
   else if (COMMAND === "convert-equation") commandConvertEquation();
