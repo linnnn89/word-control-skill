@@ -92,6 +92,10 @@ Cell pagination requires a single table and text detail. It returns absolute lin
 
 Table creation and border commands also preserve operation state when a later check fails. `create-table` reports whether a table was created and whether TSV filling completed; verified success checks its dimensions, supplied text and full fingerprint. Border commands retain write and rollback failures alongside final-inspection errors. Failed results have `verified:false` and `fingerprint:null`, even if part of the operation succeeded. Inspect before retrying; these results do not promise automatic rollback or replay. Other mutation commands keep their existing result contracts.
 
+Verified `set-table-borders`, `set-cell-borders` and `normalize-table-borders` results can also supply the next expected fingerprint on the same table. Require matching document/target identity, complete verification and empty error/failure arrays. This removes a redundant full query while retaining the next write's live check. After table creation, identify the new table separately; `table_count` does not identify its index.
+
+For maintenance experiments, `tables --table N --compare-xml` adds a bounded XML comparison alongside the existing full inspection. It reports whether two normalized snapshots match, a versioned candidate hash and diagnostic timing; it does not emit XML or replace the ordinary fingerprint. `xml-v1:` candidates are explicitly rejected by mutation guards. The option requires one table, full detail and MSXML 6.0; failures return nonzero exit and no reusable fingerprint. See the [command guide](skills/word-control/references/usage.md#experimental-xml-comparison) for limits. This diagnostic still runs the full inspection and does not accelerate writes.
+
 Paragraph indices are 1-based. `--from N --max count` returns the requested page with absolute indices and `next_from` (null at the end). Starting beyond the end returns no paragraphs. Document edits can shift indices. Successful calls without the new options retain their defaults and output shapes. Failed paragraph/equation reads are marked with null text and explicit read errors; an incomplete response must not be treated as complete document evidence. Equation text and its fingerprint use one snapshot.
 
 Before changing content, read [the editing workflow](skills/word-control/references/workflow.md), use the active document path returned by `status`, and obtain fresh selection or full object guards. The short [Skill entry](skills/word-control/SKILL.md) routes to the [command guide](skills/word-control/references/usage.md), [recovery guide](skills/word-control/references/recovery.md) and [maintenance guide](skills/word-control/references/maintenance.md) as needed.
@@ -105,6 +109,8 @@ Scratch `--output` files must use `.json`, `.txt`, `.tsv`, or `.log`, must diffe
 ## Validation
 
 The test runs pure regression checks, creates a separate hidden Word instance and temporary DOCX, exercises text, table, equation, save-copy, and PDF operations, and validates every JSON output with a strict parser. Scoped-query tests cover paragraph pages, regular and merged tables, summary guard omission, and unchanged document/selection state. It removes its own artifacts. If Word is already running, command integration is skipped; a skipped result is not a complete validation.
+
+XML acceptance uses independent before/after COM reads of story text, object counts, bookmarks and table formatting, together with selection/save state. Border acceptance checks non-border state and boundaries outside the target and its shared neighbors. These tests cover the exercised scope; a stable XML snapshot does not establish complete document or effective-formatting equivalence. Upstream risk references and scope requirements are recorded in the maintenance guide.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\skills\word-control\scripts\test_word_control.ps1"

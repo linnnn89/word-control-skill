@@ -557,4 +557,47 @@ test('Border results retain write and rollback failures when final inspection al
   } finally { Object.assign(context, original); }
 });
 
+test('XML comparison is bounded, optional, and cannot replace a live mutation guard', () => {
+  const original = { getWord: context.getWord, tableFingerprint: context.tableFingerprint,
+    compareTableXml: context.compareTableXml };
+  let result, compareCalls = 0, fail = false;
+  const table = { Rows: { Count: 1 }, Columns: { Count: 1 }, Cell: () => ({ Range: { Text: 'A\r\x07' } }) };
+  const tables = () => table; tables.Count = 1;
+  const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', Tables: tables };
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+  context.tableFingerprint = () => 'abc12345';
+  context.compareTableXml = () => {
+    compareCalls++;
+    return { candidate: fail ? null : 'xml-v1:12345678', stable: !fail, sourceChars: 100,
+      normalizedChars: 80, elapsedMs: 1, errors: fail ? ['XML unavailable'] : [] };
+  };
+  context.emit = output => { result = JSON.parse(output); };
+  try {
+    context.ARGS = ['tables', '--table', '1'];
+    context.commandTables();
+    assert.equal(compareCalls, 0);
+    assert.equal('xml_comparison' in result.tables[0], false);
+    context.ARGS.push('--compare-xml', '--expect-path', doc.FullName);
+    context.commandTables();
+    assert.equal(result.tables[0].fingerprint, 'abc12345');
+    assert.equal(result.tables[0].xml_comparison.candidate_hash, 'xml-v1:12345678');
+    assert.equal(result.tables[0].xml_comparison.diagnostic_only, true);
+    assert.equal(result.document.path, doc.FullName);
+    context.ARGS = ['set-cell', '--expect-table-fingerprint', 'xml-v1:12345678', '--allow-unverified-target'];
+    assert.throws(() => context.requireFingerprint('abc12345', '--expect-table-fingerprint', '--allow-unverified-target'), /cannot authorize/);
+    for (const args of [['tables', '--compare-xml'], ['tables', '--table', '1', '--detail', 'text', '--compare-xml']]) {
+      context.ARGS = args;
+      assert.throws(() => context.commandTables(), /single table.*full/);
+    }
+    context.ARGS = ['tables', '--table', '1', '--compare-xml', '--expect-path', doc.FullName];
+    fail = true; context.lastError = '';
+    assert.throws(() => context.commandTables(), /Exit 3/);
+    assert.equal(result.ok, false);
+    assert.equal(result.tables[0].fingerprint, null);
+    assert.equal(result.tables[0].inspection_complete, false);
+    assert.equal(result.tables[0].xml_comparison.candidate_hash, null);
+    assert.deepEqual(result.tables[0].xml_comparison.errors, ['XML unavailable']);
+  } finally { Object.assign(context, original); }
+});
+
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));

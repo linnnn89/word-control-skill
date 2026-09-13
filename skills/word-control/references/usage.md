@@ -46,6 +46,14 @@ Without the new options, successful paragraph/table limits, full-detail fields a
 
 Paragraph results do not provide selection mutation guards. For writing, read the [editing workflow](workflow.md) and obtain the appropriate fresh selection or object inspection.
 
+### Experimental XML comparison
+
+For maintenance experiments, `tables --table N --compare-xml --expect-path "<doc>"` adds `xml_comparison` to a single full table inspection. Ordinary queries do not run this comparison. The optional result contains a versioned `candidate_hash`, `stable_repeat`, character counts, elapsed milliseconds and errors; it never emits the XML itself. The ordinary `fingerprint` still comes from the existing full COM inspection.
+
+The diagnostic reads `Range.WordOpenXML` twice, removes only editing-session `rsid` attributes and the settings `rsids` list, and compares the normalized strings. Content, styles, themes and actual tracked revisions remain. `stable_repeat:true` only establishes that these two normalized reads matched; it does not prove equivalence to effective COM formatting or stability across every edit/save cycle. `xml-v1:` hashes cannot authorize any mutation, including with an unsafe flag.
+
+This option requires full detail and one `--table`; it cannot be combined with cell pagination or `--max`. Processing is limited to 8 Mi characters per snapshot and requires Windows MSXML 6.0, with DTDs and external resolution disabled. A parse error, oversized snapshot, unsupported snapshot shape, unstable repeat or incomplete full inspection returns nonzero exit, `ok:false`, `fingerprint:null`, `inspection_complete:false` and explicit errors. For normal editing, omit the diagnostic flag and obtain a fresh complete full inspection. See [maintenance](maintenance.md) before using this comparison to investigate performance.
+
 
 ## Back Up
 
@@ -114,7 +122,9 @@ For `create-table`, `applied:true` means Word returned the created table, even i
 
 For border commands, `applied:true` means all requested writes returned and their immediate readbacks passed, even if the final fingerprint failed. `applied:null` indicates uncertain or partial effects; `set-*-borders` can return `applied:false` when snapshot capture failed before any write. Check `failures` and `rollback_failures` as well as final-inspection `errors`. `rolled_back:true` records successful rollback calls (or no writes), not a transaction guarantee or permission to retry.
 
-Border edges are `top`, `left`, `bottom`, `right`, `inside-h`, and `inside-v`; `outer` expands to the four outside edges and `all` selects every valid edge for the scope. Supported point widths are `0.25`, `0.5`, `0.75`, `1`, `1.5`, `2.25`, `3`, `4.5`, and `6`. Use `--style none` to remove selected edges. Reinspect after each change and use the new fingerprint. `layout_warnings` describe non-rectangular fallback. Fingerprint read failures produce `fingerprint:null` and `inspection_complete:false`; do not mutate from an incomplete inspection. Any `read_errors`, `failure_count`, rollback failures, or a nonzero exit mean the operation is not fully verified.
+After `set-table-borders`, `set-cell-borders` or `normalize-table-borders`, reuse the returned fingerprint for the next operation on the same verified table only when `ok`, `applied`, `verified` and `inspection_complete` are true, document/target identity matches, and all error/failure arrays are empty. This avoids an extra full query; the next mutation still computes and compares a fresh live fingerprint. A different target, incomplete result or needed visual review requires inspection. After `create-table`, identify its index separately; `table_count` is not the created table's index.
+
+Border edges are `top`, `left`, `bottom`, `right`, `inside-h`, and `inside-v`; `outer` expands to the four outside edges and `all` selects every valid edge for the scope. Supported point widths are `0.25`, `0.5`, `0.75`, `1`, `1.5`, `2.25`, `3`, `4.5`, and `6`. Use `--style none` to remove selected edges. Use the verified result or a fresh full inspection for the next fingerprint. `layout_warnings` describe non-rectangular fallback. Fingerprint read failures produce `fingerprint:null` and `inspection_complete:false`; do not mutate from an incomplete inspection. Any `read_errors`, `failure_count`, rollback failures, or a nonzero exit mean the operation is not fully verified.
 
 ## Equations
 
