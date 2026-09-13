@@ -205,6 +205,39 @@ test('Output preflight rejects document paths, collisions, and unapproved overwr
   assert.equal(writes.at(-1).mode, 1, 'New outputs must use exclusive creation');
 });
 
+test('Scratch outputs reject protected-file short aliases and unconfirmed identity without blocking independent outputs', () => {
+  const original = context.fso, previousArgs = context.ARGS;
+  const full = 'C:\\test\\long-input-file.txt', short = 'C:\\test\\LONG-I~1.TXT';
+  const independent = 'C:\\test\\independent-output.txt', independentShort = 'C:\\test\\INDEPE~1.TXT';
+  const aliases = new Map([[full, short], [short, short], [independent, independentShort], [independentShort, independentShort]]);
+  let identityReads = 0, failure = '';
+  context.fso = { ...original,
+    FileExists: value => aliases.has(value),
+    GetFile(value) {
+      identityReads++;
+      if (failure === 'throw') throw new Error('Identity read unavailable');
+      return { ShortPath: failure === 'empty' ? '' : aliases.get(value) };
+    },
+  };
+  try {
+    for (const protectedOption of ['--input', '--expect-path', '--path']) {
+      for (const [protectedPath, outputPath] of [[full, short], [short, full]]) {
+        context.ARGS = ['help', protectedOption, protectedPath, '--output', outputPath, '--overwrite'];
+        assert.throws(() => context.preflightOutput(), /--output must differ/, 'Overwrite approval must not permit replacing a protected file through its alias');
+      }
+    }
+    context.ARGS = ['help', '--input', full, '--output', independentShort, '--overwrite'];
+    context.preflightOutput();
+    for (failure of ['throw', 'empty']) {
+      assert.throws(() => context.preflightOutput(), /Identity read unavailable|cannot verify existing output file identity/);
+    }
+    identityReads = 0;
+    context.ARGS = ['help', '--input', full, '--output', 'C:\\test\\new-output.json'];
+    context.preflightOutput();
+    assert.equal(identityReads, 0, 'A new output must not require existing-file identity reads');
+  } finally { context.fso = original; context.ARGS = previousArgs; }
+});
+
 test('Paragraph pages preserve legacy output and read only the requested absolute indices', () => {
   let allowed = [1, 80];
   const visited = [];

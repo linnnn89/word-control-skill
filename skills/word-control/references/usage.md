@@ -22,6 +22,8 @@ cscript //nologo $wc equations --index 1 --output equation-1.json
 
 Read-only commands are `help`, `status`, `selection`, `selection-info`, `document-text`, `find-text`, `paragraphs`, `tables`, `equations`, and `convert-equation`.
 
+`--output` is a scratch `.json`, `.txt`, `.tsv` or `.log` file and must differ from `--input`, `--expect-path` and `--path`, including Windows 8.3 aliases of existing files. `--overwrite` only permits replacing an independent output. A collision or unreadable existing-file identity stops the command before it reads input or attaches to Word; choose a separate output path and retry.
+
 Use the active document path returned by `status` as `<doc>`. For an unsaved document, use its exact name with `--expect-name` instead.
 
 To open a document, use `open --path "<doc>"`. The command temporarily sets Word's [AutomationSecurity](https://learn.microsoft.com/en-us/office/vba/api/word.application.automationsecurity) to force-disable document macros, verifies that setting before opening, and then restores the original value. Failure to establish the guard prevents the open call. This controls programmatic document macros, not every Office parser, add-in or external-content behavior.

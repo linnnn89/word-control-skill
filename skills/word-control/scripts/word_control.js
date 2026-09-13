@@ -150,7 +150,7 @@ function preflightOutput() {
   var protectedOptions = ["--input", "--expect-path", "--path"];
   for (var i = 0; i < protectedOptions.length; i++) {
     var protectedPath = opt(protectedOptions[i], "");
-    if (protectedPath && canonicalPath(path) === canonicalPath(protectedPath)) {
+    if (protectedPath && sameOutputFile(path, protectedPath)) {
       die("--output must differ from " + protectedOptions[i]);
     }
   }
