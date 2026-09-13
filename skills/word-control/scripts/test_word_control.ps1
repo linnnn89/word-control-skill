@@ -78,6 +78,44 @@ function Wait-ForOwnedWordExit {
     return $newPids
 }
 
+function Test-ScratchOutputIdentity {
+    $source = Join-Path $runDir 'long-equation-input-for-output-identity.txt'
+    $control = Join-Path $runDir 'unrelated-equation-input.txt'
+    $destination = Join-Path $runDir 'independent-scratch-output.txt'
+    [IO.File]::WriteAllText($source, 'x+1', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($control, 'y+2', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($destination, 'previous scratch output', [Text.UTF8Encoding]::new($false))
+    $before = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    $controlBefore = (Get-FileHash -LiteralPath $control -Algorithm SHA256).Hash
+    $fso = New-Object -ComObject Scripting.FileSystemObject
+    try {
+        $shortSource = [string]$fso.GetFile($source).ShortPath
+        $shortDestination = [string]$fso.GetFile($destination).ShortPath
+    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($fso) }
+    if ($shortSource -ieq $source) {
+        return [pscustomobject]@{ok=$true; short_alias_available=$false; alias_checks='skipped-no-short-alias'}
+    }
+    $failure = Assert-WordControlFailure convert-equation --input $source --format latex --output $shortSource --overwrite
+    if ($failure -notlike '*--output must differ from --input*') { throw 'Input alias was not rejected by output preflight' }
+    $failure = Assert-WordControlFailure convert-equation --input $shortSource --format latex --output $source --overwrite
+    if ($failure -notlike '*--output must differ from --input*') { throw 'Reverse input alias was not rejected by output preflight' }
+    foreach ($protectedOption in '--expect-path','--path') {
+        $arguments = @('convert-equation', '--input', $control, '--format', 'latex', $protectedOption, $source, '--output', $shortSource, '--overwrite')
+        $failure = Assert-WordControlFailure @arguments
+        if (-not $failure.Contains("--output must differ from $protectedOption")) { throw "Protected alias was not rejected: $protectedOption" }
+    }
+    $failure = Assert-WordControlFailure replace-selection --input $source --output $shortSource --overwrite --yes
+    if ($failure -notlike '*--output must differ from --input*') { throw 'Mutation reached document handling before output preflight rejected the alias' }
+    if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $before -or
+        (Get-FileHash -LiteralPath $control -Algorithm SHA256).Hash -ne $controlBefore) { throw 'Rejected output collision changed an input file' }
+    $null = Invoke-WordControl convert-equation --input $source --format latex --output $shortDestination --overwrite
+    $converted = Read-Utf8Json $destination
+    if (-not $converted.ok -or $converted.linear -ne 'x+1') { throw 'Independent output through a short path failed' }
+    if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $before -or
+        (Get-FileHash -LiteralPath $control -Algorithm SHA256).Hash -ne $controlBefore) { throw 'Independent output changed an input file' }
+    return [pscustomobject]@{ok=$true; short_alias_available=$true; blocked_collisions=5; independent_output_verified=$true; source_bytes_unchanged=$true}
+}
+
 function Test-SmokeOutputProtection([string]$Fixture) {
     $target = Join-Path $runDir 'preserved-smoke.docx'
     Copy-Item -LiteralPath $Fixture -Destination $target
@@ -133,6 +171,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'pure regression checks failed' }
     $pureResult = ($pureOutput -join [Environment]::NewLine) | ConvertFrom-Json
     if (-not $pureResult.ok) { throw 'pure regression checks did not report success' }
+    $scratchOutputIdentity = Test-ScratchOutputIdentity
+    $scratchOutputIdentity | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDir 'scratch-output-identity.json') -Encoding UTF8
     $equationInput = Join-Path $runDir 'equation.txt'
     [IO.File]::WriteAllText($equationInput, '\frac{a+b}{c} + \alpha', [Text.UTF8Encoding]::new($false))
     $convertedOutput = Join-Path $runDir 'converted-equation.json'
@@ -204,7 +244,8 @@ try {
         }
         $saveOutputGuards = ($guardOutput -join [Environment]::NewLine) | ConvertFrom-Json
         if (-not $saveOutputGuards.ok -or -not $saveOutputGuards.saved_readback -or -not $saveOutputGuards.late_close_edit_preserved -or
-            -not $saveOutputGuards.macro_disabled_open.ok) { throw 'Save/output/open regression did not verify success' }
+            -not $saveOutputGuards.macro_disabled_open.ok -or -not $saveOutputGuards.selection_readback.ok -or
+            -not $saveOutputGuards.selection_kinds.ok) { throw 'Save/output/open/selection regression did not verify success' }
         $saveOutputGuards | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runDir 'save-output-guards.json') -Encoding UTF8
     }
 
@@ -276,6 +317,7 @@ try {
         ok = $true
         pure_regression_groups = $pureResult.pure_regression_groups
         strict_json_files = $strictResult.strict_json_files
+        scratch_output_identity = $scratchOutputIdentity
         equation_conversion = 'passed'
         unsupported_equation_rejection = 'passed'
         paragraph_replacement_disabled = 'passed'

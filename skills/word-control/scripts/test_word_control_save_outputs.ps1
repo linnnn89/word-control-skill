@@ -103,6 +103,152 @@ function Get-DocumentFootprint($Document) {
       [bool]$Document.TrackRevisions) | ConvertTo-Json -Depth 8 -Compress
 }
 
+function Test-SelectionReadback($WordApplication, $ExistingDocument, [string]$OutputDirectory) {
+    $sample = $null; $table = $null; $range = $null
+    $cases = @('main','header','cell','collapsed')
+    try {
+        $sample = $WordApplication.Documents.Add()
+        $sample.TrackRevisions = $false
+        $sample.Content.Text = "Alpha`r中文`tBeta`r"
+        $sample.Sections.Item(1).Headers.Item(1).Range.Text = 'Header sentinel'
+        $position = [int]$sample.Content.End - 1
+        $table = $sample.Tables.Add($sample.Range($position, $position), 1, 1)
+        $range = $table.Cell(1,1).Range.Duplicate
+        $range.End = $range.End - 1; $range.Text = 'Cell sentinel'
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($range); $range = $null
+        $path = Join-Path $OutputDirectory 'selection-readback.docx'
+        if (Test-Path -LiteralPath $path) { throw 'Selection fixture already exists' }
+        $sample.SaveAs2([ref][object][string]$path, [ref][object]16, [ref][object]$false, [ref][object]'', [ref][object]$false)
+        $sample.Activate()
+        $diskBefore = Read-SharedHash $path
+        foreach ($kind in $cases) {
+            if ($kind -eq 'main') { $range = $sample.Range(0, 6); $expected = "Alpha`n" }
+            elseif ($kind -eq 'header') {
+                $range = $sample.Sections.Item(1).Headers.Item(1).Range.Duplicate
+                $range.End = $range.End - 1; $expected = 'Header sentinel'
+            } elseif ($kind -eq 'cell') { $range = $table.Cell(1,1).Range.Duplicate; $expected = "Cell sentinel`n$([char]7)" }
+            else { $range = $sample.Range(0, 0); $expected = '' }
+            $range.Select()
+            $before = Get-DocumentFootprint $sample
+            $selectionBefore = @([int]$WordApplication.Selection.StoryType, [int]$WordApplication.Selection.Start, [int]$WordApplication.Selection.End)
+            $savedBefore = [bool]$sample.Saved
+            $output = Join-Path $OutputDirectory ($kind + '-selection.txt')
+            $null = Invoke-Bridge @('selection', '--output', $output)
+            if ([IO.File]::ReadAllText($output, [Text.Encoding]::UTF8) -cne $expected) { throw "Selection text mismatch: $kind" }
+            $status = Invoke-Bridge @('status')
+            $info = Invoke-Bridge @('selection-info')
+            if ($status.selection_text_length -ne $expected.Length -or $status.selection.text_length -ne $expected.Length -or
+                $info.selection.text_length -ne $expected.Length -or $status.selection.collapsed -ne ($kind -eq 'collapsed') -or
+                $info.selection.collapsed -ne ($kind -eq 'collapsed')) { throw "Selection status disagrees with the selected text: $kind" }
+            $selectionAfter = @([int]$WordApplication.Selection.StoryType, [int]$WordApplication.Selection.Start, [int]$WordApplication.Selection.End)
+            if ((Get-DocumentFootprint $sample) -cne $before -or [bool]$sample.Saved -ne $savedBefore -or
+                ($selectionAfter -join ',') -ne ($selectionBefore -join ',') -or (Read-SharedHash $path) -ne $diskBefore) { throw "Selection query changed document, selection or source bytes: $kind" }
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($range); $range = $null
+        }
+        [pscustomobject]@{ok=$true;cases=$cases;exact_text=$true;consistent_lengths=$true;document_and_selection_unchanged=$true;source_bytes_unchanged=$true}
+    } finally {
+        if ($range) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($range) }
+        if ($table) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($table) }
+        if ($sample) { $sample.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($sample) }
+        $ExistingDocument.Activate()
+    }
+}
+
+function Test-SelectionKindGuards($WordApplication, $ExistingDocument, [string]$OutputDirectory) {
+    $sample = $null; $table = $null; $range = $null
+    $modeBefore = [bool]$WordApplication.Selection.ColumnSelectMode
+    $types = @(); $refusals = 0
+    try {
+        $sample = $WordApplication.Documents.Add()
+        $sample.TrackRevisions = $false
+        $sample.Content.Text = "AAAA one end`rBBBB two end`rCCCC tri end`rprefix`rsuffix`r"
+        $sample.Content.Font.Name = 'Consolas'; $sample.Content.Font.Size = 12
+        $sample.Sections.Item(1).Headers.Item(1).Range.Text = 'Untouched selection guard header'
+        $sample.Bookmarks.Add('outside_selection_guard', $sample.Range(0,4)) | Out-Null
+        $position = ([string]$sample.Content.Text).IndexOf('suffix')
+        $table = $sample.Tables.Add($sample.Range($position,$position), 3, 3)
+        for ($row=1; $row -le 3; $row++) { for ($column=1; $column -le 3; $column++) {
+            $range = $table.Cell($row,$column).Range.Duplicate; $range.End = $range.End - 1
+            $range.Text = "R${row}C${column}"
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($range); $range = $null
+        } }
+        $path = Join-Path $OutputDirectory 'selection-kind-guards.docx'
+        if (Test-Path -LiteralPath $path) { throw 'Selection-kind fixture already exists' }
+        $sample.SaveAs2([ref][object][string]$path, [ref][object]16, [ref][object]$false, [ref][object]'', [ref][object]$false)
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($table); $table = $null
+        $sample.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($sample); $sample = $null
+        $sample = $WordApplication.Documents.Open([ref][object][string]$path, [ref][object]$false, [ref][object]$false, [ref][object]$false)
+        $sample.Activate(); $table = $sample.Tables.Item(1)
+        $baseline = Get-DocumentFootprint $sample
+        $diskBefore = Read-SharedHash $path
+        $inputFile = Join-Path $OutputDirectory 'selection-kind-input.txt'
+        [IO.File]::WriteAllText($inputFile, 'replacement', [Text.UTF8Encoding]::new($false))
+        foreach ($kind in 'column','row','block','cross-cell') {
+            $WordApplication.Selection.ColumnSelectMode = $false
+            if ($kind -eq 'column') { $table.Cell(1,2).Range.Select(); $WordApplication.Selection.SelectColumn() }
+            elseif ($kind -eq 'row') { $table.Cell(2,1).Range.Select(); $WordApplication.Selection.SelectRow() }
+            elseif ($kind -eq 'block') {
+                $sample.Range(0,0).Select(); $WordApplication.Selection.ColumnSelectMode = $true
+                [void]$WordApplication.Selection.MoveRight(2,2,1)
+                [void]$WordApplication.Selection.MoveDown(5,2,1)
+                if ([int]$WordApplication.Selection.Type -ne 6) { throw 'The native block-selection fixture was not established' }
+            } else { $sample.Range([int]$table.Cell(1,1).Range.Start + 1, [int]$table.Cell(2,2).Range.Start + 2).Select() }
+            $type = [int]$WordApplication.Selection.Type; $types += $type
+            $beforeSelection = @($type, [int]$WordApplication.Selection.StoryType, [int]$WordApplication.Selection.Start, [int]$WordApplication.Selection.End, [bool]$WordApplication.Selection.ColumnSelectMode) -join ','
+            $info = Invoke-Bridge @('selection-info')
+            if ($info.selection.selection_type -ne $type -or $info.selection.range_edit_supported -ne $false) { throw "Ambiguous selection was not identified: $kind" }
+            $status = Invoke-Bridge @('status')
+            if ($null -ne $status.selection_text_length -or $status.selection.range_edit_supported -ne $false) { throw "Status reported a misleading selected-text length: $kind" }
+            $failure = Invoke-Bridge @('selection') -ExpectFailure
+            if ($failure -notlike '*unsupported selection range*') { throw 'Raw selection text was not refused' }
+            $guards = @('--expect-story-type', [string]$info.selection.story_type, '--expect-start', [string]$info.selection.start,
+              '--expect-end', [string]$info.selection.end, '--expect-selection-hash', [string]$info.selection.text_hash)
+            foreach ($command in 'replace-selection','insert-comment','create-table','insert-equation') {
+                $arguments = @($command, '--input', $inputFile, '--expect-path', $path, '--yes', '--allow-unverified-selection') + $guards
+                if ($command -eq 'replace-selection') { $arguments += '--track' }
+                if ($command -eq 'create-table') { $arguments += @('--rows','1','--cols','1','--at','selection') }
+                if ($command -eq 'insert-equation') { $arguments += @('--format','linear','--at','selection') }
+                $failure = Invoke-Bridge $arguments -ExpectFailure
+                if ($failure -notlike '*unsupported selection range*') { throw "Mutation did not reject its ambiguous selection: $command/$kind" }
+                $afterSelection = @([int]$WordApplication.Selection.Type, [int]$WordApplication.Selection.StoryType, [int]$WordApplication.Selection.Start, [int]$WordApplication.Selection.End, [bool]$WordApplication.Selection.ColumnSelectMode) -join ','
+                if ((Get-DocumentFootprint $sample) -cne $baseline -or -not [bool]$sample.Saved -or $afterSelection -ne $beforeSelection -or
+                    (Read-SharedHash $path) -ne $diskBefore) { throw "Refusal changed the document, selection or source: $command/$kind" }
+                $refusals++
+            }
+        }
+        $WordApplication.Selection.ColumnSelectMode = $false
+        foreach ($command in 'replace-selection','insert-comment') {
+            $table.Cell(2,2).Range.Select()
+            $info = Invoke-Bridge @('selection-info')
+            if (-not $info.selection.range_edit_supported) { throw 'A complete single cell was rejected' }
+            $guards = @('--expect-story-type', [string]$info.selection.story_type, '--expect-start', [string]$info.selection.start,
+              '--expect-end', [string]$info.selection.end, '--expect-selection-hash', [string]$info.selection.text_hash)
+            $result = Invoke-Bridge (@($command, '--input', $inputFile, '--expect-path', $path, '--yes') + $guards)
+            if (-not $result.ok) { throw 'Single-cell mutation did not report success' }
+        }
+        if ([string]$table.Cell(2,2).Range.Text -cne "replacement`r$([char]7)" -or $sample.Comments.Count -ne 1) { throw 'Single-cell edits did not affect the expected cell' }
+        $scope = $sample.Comments.Item(1).Scope
+        if ($scope.Cells.Count -ne 1 -or $scope.Cells.Item(1).RowIndex -ne 2 -or $scope.Cells.Item(1).ColumnIndex -ne 2) { throw 'Comment targeted a different cell' }
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($scope)
+        $sample.Comments.Item(1).Delete()
+        $range = $table.Cell(2,2).Range.Duplicate; $range.End = $range.End - 1; $range.Text = 'R2C2'
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($range); $range = $null
+        if ((Get-DocumentFootprint $sample) -cne $baseline) { throw 'Single-cell editing affected other content or formatting' }
+        $null = Invoke-Bridge @('save-active','--expect-path',$path,'--yes')
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($table); $table = $null
+        $sample.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($sample); $sample = $null
+        $sample = $WordApplication.Documents.Open([ref][object][string]$path, [ref][object]$false, [ref][object]$false, [ref][object]$false)
+        if ((Get-DocumentFootprint $sample) -cne $baseline) { throw 'Restored selection fixture changed after save and reopen' }
+        [pscustomobject]@{ok=$true;selection_types=$types;blocked_mutations=$refusals;blocked_reads=4;refusals_preserved_state=$true;single_cell_edits_verified=$true;restored_scope_persisted=$true}
+    } finally {
+        if ($range) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($range) }
+        if ($table) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($table) }
+        if ($sample) { $sample.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($sample) }
+        $ExistingDocument.Activate()
+        $WordApplication.Selection.ColumnSelectMode = $modeBefore
+    }
+}
+
 function Test-MacroDisabledOpen($WordApplication, $ExistingDocument, [string]$FixturePath, [string]$OutputDirectory) {
     $openSource = Join-Path $OutputDirectory 'open-guard-source.docx'
     if (Test-Path -LiteralPath $openSource) { throw 'Open-security fixture already exists' }
@@ -219,10 +365,12 @@ try {
     $prefix.Text = ''
     [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($prefix)
     if ((Get-DocumentFootprint $doc) -ne $expected) { throw 'Saved/reopened document differs from expected content or structure' }
+    $selectionReadback = Test-SelectionReadback $word $doc $Directory
+    $selectionKinds = Test-SelectionKindGuards $word $doc $Directory
     $macroDisabledOpen = Test-MacroDisabledOpen $word $doc $Fixture $Directory
     [pscustomobject]@{ok=$true; word_version=$version; cancellation_events=[WordControlSaveCancellation]::Calls;
         locked_outputs_preserved=2; pdf_paths_rejected=3; source_scope_unchanged=$true; saved_readback=$true; late_close_edit_preserved=$true;
-        macro_disabled_open=$macroDisabledOpen} | ConvertTo-Json -Depth 5
+        macro_disabled_open=$macroDisabledOpen; selection_readback=$selectionReadback; selection_kinds=$selectionKinds} | ConvertTo-Json -Depth 5
 }
 finally {
     if ($attached) { [void][Runtime.InteropServices.ComEventsHelper]::Remove($word, [WordControlSaveCancellation]::Events, 8, [WordControlSaveCancellation]::Handler) }

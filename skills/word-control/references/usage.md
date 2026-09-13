@@ -22,6 +22,10 @@ cscript //nologo $wc equations --index 1 --output equation-1.json
 
 Read-only commands are `help`, `status`, `selection`, `selection-info`, `document-text`, `find-text`, `paragraphs`, `tables`, `equations`, and `convert-equation`.
 
+`selection` returns the supported range's text with paragraph marks converted to line feeds. At an insertion point it returns an empty string, and `status.selection_text_length` is zero. It refuses ambiguous selections, including multiple cells and rectangular blocks. For those selections, `status.selection_text_length` is null and `selection.range_edit_supported` is false. An unreadable snapshot also leaves the length null and adds `selection_read_error`; do not treat it as empty text. In `selection-info`, `selection.text_length` describes the captured Range, which may span unselected content for an unsupported selection.
+
+`--output` is a scratch `.json`, `.txt`, `.tsv` or `.log` file and must differ from `--input`, `--expect-path` and `--path`, including Windows 8.3 aliases of existing files. `--overwrite` only permits replacing an independent output. A collision or unreadable existing-file identity stops the command before it reads input or attaches to Word; choose a separate output path and retry.
+
 Use the active document path returned by `status` as `<doc>`. For an unsaved document, use its exact name with `--expect-name` instead.
 
 To open a document, use `open --path "<doc>"`. The command temporarily sets Word's [AutomationSecurity](https://learn.microsoft.com/en-us/office/vba/api/word.application.automationsecurity) to force-disable document macros, verifies that setting before opening, and then restores the original value. Failure to establish the guard prevents the open call. This controls programmatic document macros, not every Office parser, add-in or external-content behavior.
@@ -71,7 +75,7 @@ If Word cannot create a copy while the source has unsaved changes, the command f
 
 ## Selection Changes
 
-Use `story_type`, `start`, `end`, and `text_hash` from the same fresh `selection-info` result:
+Require `selection.range_edit_supported:true` and use `story_type`, `start`, `end`, and `text_hash` from the same fresh `selection-info` result:
 
 ```powershell
 cscript //nologo $wc replace-selection --input revised.txt --track --expect-path "<doc>" --expect-story-type <story_type> --expect-start <start> --expect-end <end> --expect-selection-hash <hash> --yes
@@ -79,7 +83,9 @@ cscript //nologo $wc replace-selection --input revised.txt --track --expect-path
 cscript //nologo $wc insert-comment --input comment.txt --expect-path "<doc>" --expect-story-type <story_type> --expect-start <start> --expect-end <end> --expect-selection-hash <hash> --yes
 ```
 
-Snapshots now require `story_type` as well as the three older selection values; refresh old snapshots and command templates. A successful `--track` edit keeps Track Changes on; a failed edit attempts to restore its previous state and reports restoration failures.
+Snapshots include Word's `selection_type` and `range_edit_supported`. The opaque `text_hash` includes the selection type as well as text; refresh snapshots after upgrading or changing the selection. The same four guard arguments remain required. A successful `--track` edit keeps Track Changes on; a failed edit attempts to restore its previous state and reports restoration failures.
+
+Selection-based writes support ordinary contiguous text, insertion points and exactly one complete table cell. Multiple-cell spans, whole rows/columns across cells, rectangular blocks, frames, shapes and unknown selection types are refused before writing, even with `--allow-unverified-selection`. Use scoped table queries and cell-targeted commands for multiple cells. This boundary applies to `replace-selection`, `insert-comment`, and `create-table`/`insert-equation` with `--at selection`; `--at end` does not use the current selection.
 
 Selection changes invalidate the snapshot. Inspect again before a second change. A collapsed selection is rejected unless insertion is deliberate and `--allow-insert` is also supplied.
 

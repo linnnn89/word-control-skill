@@ -13,7 +13,7 @@ For discovery, use `find-text` in the relevant story, bounded paragraph pages or
 1. Run `status` and confirm the active document name, full path, save state, read-only state, and protection state.
 2. Establish a verified backup before the first edit, following [Backup before editing](#backup-before-editing).
 3. Inspect the exact target immediately before mutation:
-   - Text or comments: run `selection-info` and retain `story_type`, `start`, `end`, and `text_hash`.
+   - Text or comments: run `selection-info`, require `selection.range_edit_supported:true`, and retain `story_type`, `start`, `end`, and `text_hash`.
    - Tables: run `tables --table N` in full detail and retain the target table's `fingerprint`.
    - Equations: run `equations --index N` and retain the target equation's `fingerprint`.
 4. Put non-ASCII input in a task-local UTF-8 file. Use an isolated temporary folder, not the document's source folder unless necessary.
@@ -41,7 +41,7 @@ This is an instruction for the agent's editing workflow; mutation commands do no
 ## Non-Negotiable Guards
 
 - Require `--expect-path` for saved documents. Use `--expect-name` only for an intentionally unsaved document.
-- Require all four selection values from one fresh `selection-info` result: `--expect-story-type`, `--expect-start`, `--expect-end`, and `--expect-selection-hash`.
+- Require `selection.range_edit_supported:true` and all four selection values from one fresh `selection-info` result: `--expect-story-type`, `--expect-start`, `--expect-end`, and `--expect-selection-hash`. For tables/equations inserted at the selection, apply the same check. Unsupported selection kinds cannot be bypassed with an override; use the [selection guidance](usage.md#selection-changes) to choose a supported target.
 - Require `--expect-table-fingerprint` or `--expect-equation-fingerprint` from a fresh inspection before indexed object changes.
 - Treat `--allow-active`, `--allow-unverified-selection`, `--allow-unverified-target`, and `--allow-insert` as exceptional overrides. Use them only after manual target verification and only when their specific behavior is intended.
 - Refuse an existing backup, PDF, or smoke-test output unless the user explicitly approved replacement and `--overwrite` is passed.

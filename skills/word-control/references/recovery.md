@@ -4,7 +4,8 @@
 
 - `no running Word instance found`: open the intended document in desktop Word.
 - `active document path mismatch`: bring the intended document to the front and rerun `status`.
-- `selection ... changed`: rerun `selection-info`; use story type, start, end and hash from the same result.
+- `selection ... changed`: rerun `selection-info`; use story type, start, end and hash from the same result. The hash also changes with the selection type; refresh snapshots after upgrading.
+- `unsupported selection range`: select contiguous text or one complete table cell. Use scoped table queries and cell-targeted commands for multiple cells; an override does not bypass this boundary. `status.selection_text_length:null` means unsupported or unreadable, not empty. Inspect `selection.range_edit_supported` and any `selection_read_error` before continuing.
 - `target fingerprint changed`: inspect that table with `tables --table N` or rerun `equations`. An index alone is not an identity guarantee.
 - `table index out of range`: refresh `tables --detail summary` before selecting an index; document edits can change indices.
 - `--table` with `--max`: choose either a single table or a prefix of the collection.
