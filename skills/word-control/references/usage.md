@@ -24,6 +24,10 @@ Read-only commands are `help`, `status`, `selection`, `selection-info`, `documen
 
 Use the active document path returned by `status` as `<doc>`. For an unsaved document, use its exact name with `--expect-name` instead.
 
+To open a document, use `open --path "<doc>"`. The command temporarily sets Word's [AutomationSecurity](https://learn.microsoft.com/en-us/office/vba/api/word.application.automationsecurity) to force-disable document macros, verifies that setting before opening, and then restores the original value. Failure to establish the guard prevents the open call. This controls programmatic document macros, not every Office parser, add-in or external-content behavior.
+
+The open result retains `action` and `path`, and adds `opened`, `automation_security_restored` and `errors`. `opened:true` means Word returned an opened document; false means opening was not attempted, and null means the call threw with uncertain effects. Any preparation, open or restoration error returns a nonzero exit. Inspect the current documents and security state before retrying; a restoration failure can leave the requested document open. Failed opens only clean up an empty Word instance created by that command, never an existing user instance or an instance with documents.
+
 ### Scoped queries
 
 - `paragraphs --from N --max count` reads only the requested entries of Word's document paragraph collection. Indices are 1-based and remain absolute in the result. `--max` defaults to 80. With `--from`, the result adds `from` and `next_from`; `next_from:null` means the end. Starting beyond the end returns an empty page. These are live indices, not stable cursors across edits; refresh after document changes.
@@ -120,7 +124,7 @@ Table fingerprints include raw Word text, including paragraph and cell-boundary 
 
 If a write completes but readback or formatting inspection fails, `set-cell` returns `applied:true`, `verified:false`, `fingerprint:null` and a nonzero exit. If the write itself throws, `applied:null` means its effect is unknown. Inspect the current document before retrying; neither case promises rollback or permits automatic replay.
 
-`swap-cell-text`, `set-cell-shading`, `insert-row`, `delete-row`, `insert-column`, `delete-column`, `create-table`, `set-table-borders`, `set-cell-borders` and `normalize-table-borders` also return `document`, `applied`, `verified`, `inspection_complete` and `errors`, preserving their existing success fields. Any write, readback or final-inspection error returns a nonzero exit, `verified:false`, `inspection_complete:false` and `fingerprint:null`. A later inspection failure does not replace earlier write or rollback errors. Other mutation commands retain their existing contracts.
+`swap-cell-text`, `set-cell-shading`, `insert-row`, `delete-row`, `insert-column`, `delete-column`, `create-table`, `set-table-borders`, `set-cell-borders` and `normalize-table-borders` also return `document`, `applied`, `verified`, `inspection_complete` and `errors`, preserving their existing success fields. Any write, readback or final-inspection error returns a nonzero exit, `verified:false`, `inspection_complete:false` and `fingerprint:null`. A later inspection failure does not replace earlier write or rollback errors. Whole-table and equation deletion use the [deletion result contract](#deletion-results).
 
 `swap-cell-text` and `set-cell-shading` return `readback.matches_requested`, `failure_count`, `failures`, `rolled_back` and `rollback_failures`; shading readback also contains the actual `color_value` and `texture`. If only the final inspection fails, `applied:true` records the completed, read-back write without rolling it back. Write/readback failures attempt restoration: `applied:false` and `rolled_back:true` require successful restoration calls and matching original text or shading values. A restoration error, mismatch or unreadable value yields `applied:null`. This verifies the restored cell text or background/texture values, not full rich formatting, document save state or embedded objects. Inspect before retrying; replaying a completed swap would reverse it.
 
@@ -133,6 +137,16 @@ For border commands, `applied:true` means all requested writes returned and thei
 After a verified cell text, shading, row/column or border command, reuse the returned fingerprint for the next operation on the same verified table under the [workflow checks](workflow.md#core-workflow). This avoids an extra full query; the next mutation still computes and compares a fresh live fingerprint. A different target, uncertain structural index, incomplete result or needed visual review requires inspection. After `create-table`, identify its index separately; `table_count` is not the created table's index.
 
 Border edges are `top`, `left`, `bottom`, `right`, `inside-h`, and `inside-v`; `outer` expands to the four outside edges and `all` selects every valid edge for the scope. Supported point widths are `0.25`, `0.5`, `0.75`, `1`, `1.5`, `2.25`, `3`, `4.5`, and `6`. Use `--style none` to remove selected edges. Use the verified result or a fresh full inspection for the next fingerprint. `layout_warnings` describe non-rectangular fallback. Fingerprint read failures produce `fingerprint:null` and `inspection_complete:false`; do not mutate from an incomplete inspection. Any `read_errors`, `failure_count`, rollback failures, or a nonzero exit mean the operation is not fully verified.
+
+### Deletion results
+
+`delete-table` enforces the structural Track Changes guard. An explicitly approved `--allow-track-changes` permits the call, but does not establish removal: Word may retain a table or OMath object while its deletion revision is pending. `delete-equation` can still record tracked edits. Neither command changes tracking policy, accepts revisions, repeats deletion or reconstructs deleted content.
+
+Both commands retain `remaining_tables` or `remaining_equations` and add document/target identity, `track_revisions`, `applied`, `verified`, `inspection_complete`, `readback` and `errors`. A verified success requires the delete call to complete and the relevant collection count to decrease by exactly one. `readback.expected_remaining` records that expected count; `matches_requested` is true/false, or null if the remaining count is unreadable/invalid. This count check does not establish preservation of neighboring content or document layout; perform the task's affected-scope checks separately. A deleted target has no reusable guard, so `fingerprint` is always null and remaining targets must be inspected again.
+
+`applied:true` records a returned delete call, even when a retained revision or failed readback prevents confirmed removal. For equations, `deleted_units` is Word's reported [Range.Delete result](https://learn.microsoft.com/en-us/office/vba/api/word.range.delete), not proof that the OMath object disappeared; a zero result sets `applied:false`. A thrown call or invalid return leaves `applied:null`. Write and count-read errors are retained together. Unconfirmed removal returns a nonzero exit with `verified:false` and `inspection_complete:false`; inspect the current target and revision state before any further edit.
+
+With tracking off, a display equation is first set to [inline form](https://learn.microsoft.com/en-us/office/vba/api/word.omath.type), so deleting its range can remove the equation instead of leaving an empty OMath at the paragraph mark. `prepared_inline` is true after that setting is read back, false when unnecessary, or null when preparation was attempted but could not be confirmed. Failed preparation prevents the delete call and returns `applied:null`. This preparation may have changed formatting even if a later deletion fails or returns zero; inspect the equation before continuing. Tracked equations retain their original form and revision history.
 
 ## Equations
 
@@ -155,6 +169,8 @@ cscript //nologo $wc delete-equation --index 1 --expect-equation-fingerprint <ha
 The conservative LaTeX converter supports common fractions, square roots, integrals, sums, products, superscripts, subscripts, comparisons and Greek letters. Unknown commands, complex environments such as `align`, `matrix`, `cases`, and custom macros are unsupported. Use `--format linear` only after checking Word linear syntax.
 
 Verify the resulting OMath object after insertion or replacement. When layout matters, export a PDF for visual review.
+
+For `delete-equation`, follow the [deletion result contract](#deletion-results), especially when Track Changes is enabled.
 
 ## Save, Export, and Close
 

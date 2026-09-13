@@ -13,12 +13,24 @@ using System.Runtime.InteropServices;
 public static class WordControlSaveCancellation {
     public delegate void BeforeSave(object document, ref bool saveAsUi, ref bool cancel);
     public delegate void BeforeClose(object document, ref bool cancel);
+    public delegate void AfterOpen(object document);
     public static int Calls;
     public static int CloseCalls;
     public const string LateText = "late close sentinel ";
     public static readonly Guid Events = new Guid("00020A01-0000-0000-C000-000000000046");
     public static readonly BeforeSave Handler = CancelSave;
     public static readonly BeforeClose CloseHandler = AmendBeforeClose;
+    public static readonly AfterOpen OpenHandler = ObserveOpen;
+    public static readonly System.Collections.Generic.List<int> OpenSecurity = new System.Collections.Generic.List<int>();
+    public static string OpenError;
+    static void ObserveOpen(object document) {
+        object app = null;
+        try {
+            app = document.GetType().InvokeMember("Application", System.Reflection.BindingFlags.GetProperty, null, document, null);
+            OpenSecurity.Add(Convert.ToInt32(app.GetType().InvokeMember("AutomationSecurity", System.Reflection.BindingFlags.GetProperty, null, app, null)));
+        } catch (Exception error) { OpenError = error.Message; }
+        finally { if (app != null) Marshal.ReleaseComObject(app); }
+    }
     static void CancelSave(object document, ref bool saveAsUi, ref bool cancel) { Calls++; cancel = true; }
     static void AmendBeforeClose(object document, ref bool cancel) {
         object content = document.GetType().InvokeMember("Content", System.Reflection.BindingFlags.GetProperty, null, document, null);
@@ -48,7 +60,7 @@ function Invoke-Bridge([string[]]$Arguments, [switch]$ExpectFailure) {
         $stderr = $process.StandardError.ReadToEndAsync()
         $deadline = [DateTime]::UtcNow.AddSeconds(120)
         while (-not $process.HasExited) {
-            # Pump the STA so Word's synchronous save event reaches our C# sink.
+            # Pump the STA so Word's synchronous events reach our C# sink.
             [Windows.Forms.Application]::DoEvents()
             if ([DateTime]::UtcNow -gt $deadline) { $process.Kill(); throw 'Save/output command timed out' }
             Start-Sleep -Milliseconds 20
@@ -89,6 +101,49 @@ function Get-DocumentFootprint($Document) {
     @($stories, $bookmarks, $cells, $Document.Tables.Count, $Document.OMaths.Count, $Document.Comments.Count,
       $Document.Revisions.Count, $Document.Sections.Count, $Document.InlineShapes.Count, $Document.Shapes.Count,
       [bool]$Document.TrackRevisions) | ConvertTo-Json -Depth 8 -Compress
+}
+
+function Test-MacroDisabledOpen($WordApplication, $ExistingDocument, [string]$FixturePath, [string]$OutputDirectory) {
+    $openSource = Join-Path $OutputDirectory 'open-guard-source.docx'
+    if (Test-Path -LiteralPath $openSource) { throw 'Open-security fixture already exists' }
+    Copy-Item -LiteralPath $FixturePath -Destination $openSource
+    $diskBefore = Read-SharedHash $openSource
+    $existingBefore = Get-DocumentFootprint $ExistingDocument
+    $existingSaved = [bool]$ExistingDocument.Saved
+    $securityBefore = [int]$WordApplication.AutomationSecurity
+    $restoredModes = @()
+    $openDoc = $null
+    $openAttached = $false
+    try {
+        [Runtime.InteropServices.ComEventsHelper]::Combine($WordApplication, [WordControlSaveCancellation]::Events, 4, [WordControlSaveCancellation]::OpenHandler)
+        $openAttached = $true
+        foreach ($mode in 1,2,3) {
+            $WordApplication.AutomationSecurity = $mode
+            $callsBefore = [WordControlSaveCancellation]::OpenSecurity.Count
+            $result = Invoke-Bridge @('open', '--path', $openSource)
+            $WordApplication.Visible = $false
+            if ([WordControlSaveCancellation]::OpenError -or [WordControlSaveCancellation]::OpenSecurity.Count -ne $callsBefore + 1 -or
+                [WordControlSaveCancellation]::OpenSecurity[$callsBefore] -ne 3) { throw 'Word opened without the macro guard at its DocumentOpen event' }
+            $restoredModes += [int]$WordApplication.AutomationSecurity
+            if (-not $result.ok -or $result.opened -ne $true -or $result.automation_security_restored -ne $true -or
+                $result.errors.Count -ne 0 -or $WordApplication.AutomationSecurity -ne $mode) { throw 'Open did not confirm success and security restoration' }
+            $openDoc = $WordApplication.ActiveDocument
+            if ($openDoc.FullName -ne $openSource -or $WordApplication.Documents.Count -ne 2) { throw 'Open returned a different document or lost the existing document' }
+            if ((Get-DocumentFootprint $ExistingDocument) -ne $existingBefore -or [bool]$ExistingDocument.Saved -ne $existingSaved) { throw 'Open changed the existing document' }
+            $footprint = Get-DocumentFootprint $openDoc
+            if ($mode -eq 1) { $openedBefore = $footprint } elseif ($footprint -ne $openedBefore) { throw 'Security mode changed the opened document content or formatting' }
+            $openDoc.Close([ref][object]0)
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($openDoc)
+            $openDoc = $null
+            if ((Read-SharedHash $openSource) -ne $diskBefore) { throw 'Open changed source bytes' }
+        }
+        [pscustomobject]@{ok=$true; observed_modes=@([WordControlSaveCancellation]::OpenSecurity.ToArray());
+            restored_modes=$restoredModes; existing_document_unchanged=$true; source_bytes_unchanged=$true}
+    } finally {
+        if ($openAttached) { [void][Runtime.InteropServices.ComEventsHelper]::Remove($WordApplication, [WordControlSaveCancellation]::Events, 4, [WordControlSaveCancellation]::OpenHandler) }
+        if ($openDoc) { $openDoc.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($openDoc) }
+        $WordApplication.AutomationSecurity = $securityBefore
+    }
 }
 
 $source = Join-Path $Directory 'save-guards-source.docx'
@@ -164,8 +219,10 @@ try {
     $prefix.Text = ''
     [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($prefix)
     if ((Get-DocumentFootprint $doc) -ne $expected) { throw 'Saved/reopened document differs from expected content or structure' }
+    $macroDisabledOpen = Test-MacroDisabledOpen $word $doc $Fixture $Directory
     [pscustomobject]@{ok=$true; word_version=$version; cancellation_events=[WordControlSaveCancellation]::Calls;
-        locked_outputs_preserved=2; pdf_paths_rejected=3; source_scope_unchanged=$true; saved_readback=$true; late_close_edit_preserved=$true} | ConvertTo-Json
+        locked_outputs_preserved=2; pdf_paths_rejected=3; source_scope_unchanged=$true; saved_readback=$true; late_close_edit_preserved=$true;
+        macro_disabled_open=$macroDisabledOpen} | ConvertTo-Json -Depth 5
 }
 finally {
     if ($attached) { [void][Runtime.InteropServices.ComEventsHelper]::Remove($word, [WordControlSaveCancellation]::Events, 8, [WordControlSaveCancellation]::Handler) }

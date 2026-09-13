@@ -187,7 +187,7 @@ try {
         }
         $integration = $integrationText | ConvertFrom-Json
         if (-not $integration.ok -or -not $integration.advanced_tables -or -not $integration.scoped_inspection -or -not $integration.cell_text_fidelity -or
-            -not $integration.verified_cell_results -or -not $integration.verified_structure_results) {
+            -not $integration.verified_cell_results -or -not $integration.verified_structure_results -or -not $integration.verified_deletion_results) {
             throw 'isolated command integration returned an unsuccessful result'
         }
         $commandIntegration = 'passed'
@@ -203,8 +203,9 @@ try {
             throw "save/output regression failed; remaining Word process(es): $($guardWordPids -join ', ')`n$($guardOutput -join [Environment]::NewLine)"
         }
         $saveOutputGuards = ($guardOutput -join [Environment]::NewLine) | ConvertFrom-Json
-        if (-not $saveOutputGuards.ok -or -not $saveOutputGuards.saved_readback -or -not $saveOutputGuards.late_close_edit_preserved) { throw 'Save/output regression did not verify success' }
-        $saveOutputGuards | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDir 'save-output-guards.json') -Encoding UTF8
+        if (-not $saveOutputGuards.ok -or -not $saveOutputGuards.saved_readback -or -not $saveOutputGuards.late_close_edit_preserved -or
+            -not $saveOutputGuards.macro_disabled_open.ok) { throw 'Save/output/open regression did not verify success' }
+        $saveOutputGuards | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runDir 'save-output-guards.json') -Encoding UTF8
     }
 
     $fixtureDocument = 'not-requested'
@@ -287,6 +288,7 @@ try {
         cell_text_fidelity = $commandIntegration
         verified_cell_results = $commandIntegration
         verified_structure_results = $commandIntegration
+        verified_deletion_results = $commandIntegration
         save_output_guards = $saveOutputGuards
         fixture_document = $fixtureDocument
     } | ConvertTo-Json -Compress -Depth 5
