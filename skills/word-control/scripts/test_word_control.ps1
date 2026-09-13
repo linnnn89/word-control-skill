@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 $bridge = Join-Path $PSScriptRoot 'word_control.js'
 $integrationBridge = Join-Path $PSScriptRoot 'test_word_control_integration.js'
 $pureBridge = Join-Path $PSScriptRoot 'test_word_control_pure.cjs'
+$saveOutputBridge = Join-Path $PSScriptRoot 'test_word_control_save_outputs.ps1'
 $nodeExecutable = (Get-Command node -ErrorAction Stop).Source
 $createdRoot = -not (Test-Path -LiteralPath $TempRoot)
 $runDir = Join-Path $TempRoot (Get-Date -Format 'yyyyMMdd_HHmmss_fff')
@@ -109,6 +110,7 @@ try {
     $null = Assert-WordControlFailure smoke --path $smokeDoc --yes
 
     $commandIntegration = 'skipped-existing-word-session'
+    $saveOutputGuards = 'skipped-existing-word-session'
     if ($wordPidsBefore.Count -eq 0) {
         $smokePids = @(Wait-ForOwnedWordExit)
         if ($smokePids.Count -gt 0) {
@@ -137,6 +139,20 @@ try {
             throw 'isolated command integration returned an unsuccessful result'
         }
         $commandIntegration = 'passed'
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $guardOutput = & powershell -NoProfile -ExecutionPolicy Bypass -File $saveOutputBridge -Bridge $bridge -Directory $runDir -Fixture $smokeDoc 2>&1
+            $guardExitCode = $LASTEXITCODE
+        }
+        finally { $ErrorActionPreference = $previousPreference }
+        $guardWordPids = @(Wait-ForOwnedWordExit)
+        if ($guardExitCode -ne 0 -or $guardWordPids.Count -gt 0) {
+            throw "save/output regression failed; remaining Word process(es): $($guardWordPids -join ', ')`n$($guardOutput -join [Environment]::NewLine)"
+        }
+        $saveOutputGuards = ($guardOutput -join [Environment]::NewLine) | ConvertFrom-Json
+        if (-not $saveOutputGuards.ok -or -not $saveOutputGuards.saved_readback -or -not $saveOutputGuards.late_close_edit_preserved) { throw 'Save/output regression did not verify success' }
+        $saveOutputGuards | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDir 'save-output-guards.json') -Encoding UTF8
     }
 
     $fixtureDocument = 'not-requested'
@@ -215,6 +231,7 @@ try {
         guarded_command_integration = $commandIntegration
         advanced_table_operations = $commandIntegration
         scoped_inspection = $commandIntegration
+        save_output_guards = $saveOutputGuards
         fixture_document = $fixtureDocument
     } | ConvertTo-Json -Compress -Depth 5
 }

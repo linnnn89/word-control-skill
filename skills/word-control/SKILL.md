@@ -5,6 +5,8 @@ description: Inspect and narrowly edit the active Microsoft Word desktop documen
 
 # Word Control
 
+Before the first edit to each user document in a task, create and verify a separate backup under the [backup policy](references/workflow.md#backup-before-editing).
+
 Before acting, read the relevant manual or section. Do not load all manuals by default.
 
 - Edit, back up, save, export or close a document: [Workflow](references/workflow.md).

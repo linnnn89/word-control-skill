@@ -63,6 +63,85 @@ function prepareOutputPath(path, label) {
   return path;
 }
 
+function prepareDocumentOutputPath(path, label) {
+  // FSO MoveFile accepts wildcards; reject them, alternate streams and Win32 aliases.
+  if (!path || /[\x00-\x1f*?"<>|]/.test(path) || /:/.test(path.replace(/^[A-Za-z]:/, ""))
+      || /[. ](?:[\\\/]|$)/.test(path.replace(/(^|[\\\/])\.{1,2}(?=[\\\/])/g, "$1"))) {
+    die(label + " requires a literal file path without wildcards, streams or trailing dots/spaces");
+  }
+  path = prepareOutputPath(path, label);
+  if (fso.FolderExists(path)) die("output path is a folder: " + path);
+  return path;
+}
+
+function createOutputStage(path) {
+  var folder = fso.BuildPath(fso.GetParentFolderName(path), ".word-control-" + fso.GetTempName());
+  var extension = fso.GetExtensionName(path);
+  var suffix = extension ? "." + extension : "";
+  var stage = { folder: folder, output: fso.BuildPath(folder, "new" + suffix),
+    previous: fso.BuildPath(folder, "previous" + suffix), published: false };
+  // Exclusive folder creation reserves our paths on the destination volume.
+  fso.CreateFolder(folder);
+  return stage;
+}
+
+function sameOutputFile(first, second) {
+  if (canonicalPath(first) === canonicalPath(second)) return true;
+  if (!first || !fso.FileExists(first) || !fso.FileExists(second)) return false;
+  // Compare Windows short paths too, so an 8.3 spelling cannot rename the source.
+  var firstShort = fso.GetFile(first).ShortPath, secondShort = fso.GetFile(second).ShortPath;
+  if (!firstShort || !secondShort) throw new Error("cannot verify existing output file identity");
+  return canonicalPath(firstShort) === canonicalPath(secondShort);
+}
+
+function verifyOutputFile(path, pdf) {
+  if (!fso.FileExists(path) || Number(fso.GetFile(path).Size) <= 0) throw new Error("generated output is missing or empty: " + path);
+  if (pdf) {
+    var stream = fso.OpenTextFile(path, 1, false, 0);
+    var header;
+    try { header = stream.Read(5); } finally { stream.Close(); }
+    if (header !== "%PDF-") throw new Error("generated output has no PDF header: " + path);
+  }
+}
+
+function publishOutput(stage, path) {
+  if (fso.FolderExists(path)) throw new Error("output path became a folder: " + path);
+  var previous = fso.FileExists(path);
+  if (previous) {
+    if (!hasFlag("--overwrite")) throw new Error("refusing to overwrite an output created during generation: " + path);
+    fso.MoveFile(path, stage.previous);
+  }
+  try {
+    // MoveFile cannot overwrite a file that appeared after the preceding checks.
+    fso.MoveFile(stage.output, path);
+  } catch (publishError) {
+    if (previous) {
+      try { fso.MoveFile(stage.previous, path); }
+      catch (restoreError) {
+        throw new Error("publication failed: " + publishError.message + "; recovery failed: " + restoreError.message
+          + "; previous output retained at: " + stage.previous);
+      }
+    }
+    throw publishError;
+  }
+  stage.published = true;
+}
+
+function cleanupOutputStage(stage) {
+  if (!stage) return "";
+  try {
+    if (fso.FileExists(stage.previous)) {
+      if (!stage.published) return "previous output retained at: " + stage.previous;
+      fso.DeleteFile(stage.previous, true);
+    }
+    if (fso.FileExists(stage.output)) fso.DeleteFile(stage.output, true);
+    var folder = fso.GetFolder(stage.folder);
+    if (folder.Files.Count || folder.SubFolders.Count) return "temporary files retained in: " + stage.folder;
+    fso.DeleteFolder(stage.folder, false);
+  } catch (e) { return "temporary/recovery files retained in: " + stage.folder + "; cleanup failed: " + e.message; }
+  return "";
+}
+
 function preflightOutput() {
   var output = opt("--output", "");
   if (!output) return;
@@ -823,7 +902,7 @@ function commandHelp() {
     "  save-active --expect-path file --yes",
     "  close-active --save|--discard --expect-path file --yes",
     "  save-copy --path file --expect-path file [--overwrite] --yes",
-    "  export-pdf --path file --expect-path file [--overwrite] --yes",
+    "  export-pdf --path preview.pdf --expect-path file [--overwrite] --yes",
     "  open --path file",
     "  smoke --path new-file.docx [--overwrite] --yes",
     "",
@@ -1643,12 +1722,27 @@ function commandDeleteEquation() {
   emit("{\"ok\":true,\"action\":\"delete-equation\",\"remaining_equations\":" + Number(doc.OMaths.Count) + "}");
 }
 
+function saveAndConfirm(word, doc) {
+  doc.Save();
+  // Save can return after cancellation or while background saving is queued.
+  var deadline = new Date().getTime() + 30000;
+  while (Number(word.BackgroundSavingStatus) !== 0) {
+    if (new Date().getTime() >= deadline) throw new Error("saving is still pending; document kept open");
+    WScript.Sleep(100);
+  }
+  if (doc.Saved !== true) throw new Error("save was cancelled or could not be confirmed; document kept open");
+  var path = safeDocPath(doc);
+  if (!String(doc.Path) || !path) throw new Error("save has no confirmed file path; document kept open");
+  verifyOutputFile(path, false);
+  return path;
+}
+
 function commandSaveActive() {
   requireYes();
   var word = getWord();
   var doc = getMutationDocument(word);
   try {
-    doc.Save();
+    saveAndConfirm(word, doc);
   } catch (e) {
     die("failed to save active document: " + e.message);
   }
@@ -1665,8 +1759,9 @@ function commandCloseActive() {
   var doc = getMutationDocument(word);
   var path = safeDocPath(doc);
   try {
-    if (save) doc.Save();
-    doc.Close(false);
+    if (save) path = saveAndConfirm(word, doc);
+    // Preserve edits introduced by a close event after our explicit save check.
+    doc.Close(save ? -1 : 0);
   } catch (e) {
     die("failed to close active document: " + e.message);
   }
@@ -1675,45 +1770,59 @@ function commandCloseActive() {
 
 function commandSaveCopy() {
   requireYes();
-  var path = prepareOutputPath(opt("--path", ""), "save-copy");
+  var path = prepareDocumentOutputPath(opt("--path", ""), "save-copy");
   var word = getWord();
   var doc = getMutationDocument(word);
   var source = safeDocPath(doc);
-  if (source && canonicalPath(source) === canonicalPath(path)) die("backup path must differ from the active document path");
+  if (source && sameOutputFile(source, path)) die("backup path must differ from the active document path");
   var savedBefore = false;
-  try { savedBefore = Boolean(doc.Saved); } catch (e0) {}
-  if (fso.FileExists(path) && hasFlag("--overwrite")) fso.DeleteFile(path, true);
+  try { savedBefore = doc.Saved === true; } catch (e0) {}
+  var stage = null, failure = null, method = "SaveCopyAs";
   try {
-    doc.SaveCopyAs(path);
-    emit("{\"ok\":true,\"action\":\"save-copy\",\"method\":\"SaveCopyAs\",\"path\":" + q(path)
-      + ",\"document_saved_before\":" + boolJson(savedBefore) + ",\"includes_current_document_state\":true}");
-    return;
-  } catch (e) {
-    if (!source || !fso.FileExists(source)) die("failed to save copy and active document has no saved source path: " + e.message);
-    if (!savedBefore) die("failed to save a copy while the active document has unsaved changes; refusing stale disk-copy fallback: " + e.message);
+    stage = createOutputStage(path);
     try {
-      fso.CopyFile(source, path, false);
-      emit("{\"ok\":true,\"action\":\"save-copy\",\"method\":\"FileSystemObject.CopyFile\",\"path\":" + q(path)
-        + ",\"source\":" + q(source) + ",\"document_saved_before\":true,\"includes_current_document_state\":true}");
-      return;
-    } catch (e2) {
-      die("failed to save copy: " + e.message + "; fallback failed: " + e2.message);
+      doc.SaveCopyAs(stage.output);
+    } catch (copyError) {
+      if (!source || !fso.FileExists(source)) throw new Error("active document has no saved source path: " + copyError.message);
+      if (!savedBefore || doc.Saved !== true || canonicalPath(safeDocPath(doc)) !== canonicalPath(source)) {
+        throw new Error("active document has unsaved changes or changed identity; refusing stale disk-copy fallback: " + copyError.message);
+      }
+      if (Number(word.BackgroundSavingStatus) !== 0) throw new Error("source saving is still pending; refusing disk-copy fallback");
+      if (fso.FileExists(stage.output)) fso.DeleteFile(stage.output, true);
+      fso.CopyFile(source, stage.output, false);
+      if (doc.Saved !== true || canonicalPath(safeDocPath(doc)) !== canonicalPath(source)) throw new Error("document changed during disk-copy fallback");
+      method = "FileSystemObject.CopyFile";
     }
-  }
+    verifyOutputFile(stage.output, false);
+    publishOutput(stage, path);
+  } catch (e) { failure = e; }
+  var warning = cleanupOutputStage(stage);
+  if (failure) die("failed to save copy: " + failure.message + (warning ? "; " + warning : ""));
+  // Result delivery must not enter the generation fallback after publication.
+  emit("{\"ok\":true,\"action\":\"save-copy\",\"method\":" + q(method) + ",\"path\":" + q(path)
+    + (method === "FileSystemObject.CopyFile" ? ",\"source\":" + q(source) : "")
+    + ",\"document_saved_before\":" + boolJson(savedBefore) + ",\"includes_current_document_state\":true"
+    + (warning ? ",\"cleanup_warning\":" + q(warning) : "") + "}");
 }
 
 function commandExportPdf() {
   requireYes();
-  var path = prepareOutputPath(opt("--path", ""), "export-pdf");
+  var path = prepareDocumentOutputPath(opt("--path", ""), "export-pdf");
+  if (!/\.pdf$/i.test(path)) die("export-pdf output must use a .pdf extension");
   var word = getWord();
   var doc = getMutationDocument(word);
-  if (fso.FileExists(path) && hasFlag("--overwrite")) fso.DeleteFile(path, true);
+  if (sameOutputFile(safeDocPath(doc), path)) die("PDF output path must differ from the active document path");
+  var stage = null, failure = null;
   try {
-    doc.ExportAsFixedFormat(path, 17);
-  } catch (e) {
-    die("failed to export PDF: " + e.message);
-  }
-  emit("{\"ok\":true,\"action\":\"export-pdf\",\"path\":" + q(path) + "}");
+    stage = createOutputStage(path);
+    doc.ExportAsFixedFormat(stage.output, 17);
+    verifyOutputFile(stage.output, true);
+    publishOutput(stage, path);
+  } catch (e) { failure = e; }
+  var warning = cleanupOutputStage(stage);
+  if (failure) die("failed to export PDF: " + failure.message + (warning ? "; " + warning : ""));
+  emit("{\"ok\":true,\"action\":\"export-pdf\",\"path\":" + q(path)
+    + (warning ? ",\"cleanup_warning\":" + q(warning) : "") + "}");
 }
 
 function commandOpen() {
