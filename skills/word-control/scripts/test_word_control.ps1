@@ -78,6 +78,54 @@ function Wait-ForOwnedWordExit {
     return $newPids
 }
 
+function Test-SmokeOutputProtection([string]$Fixture) {
+    $target = Join-Path $runDir 'preserved-smoke.docx'
+    Copy-Item -LiteralPath $Fixture -Destination $target
+    $sourceHash = (Get-FileHash -LiteralPath $Fixture -Algorithm SHA256).Hash
+    $before = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+    $source = [IO.File]::ReadAllText($bridge)
+    $needle = 'function buildEquationInRange(doc, range, linearText) {'
+    if (-not $source.Contains($needle)) { throw 'Smoke generation failure injection point not found' }
+    $faultBridge = Join-Path $runDir 'smoke-generation-failure.js'
+    [IO.File]::WriteAllText($faultBridge, $source.Replace($needle, $needle + ' throw new Error("injected smoke generation failure");'), [Text.UTF8Encoding]::new($false))
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $failureOutput = & cscript //nologo $faultBridge smoke --path $target --overwrite --yes 2>&1
+        $failureExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    if ($failureExit -eq 0 -or ($failureOutput -join ' ') -notlike '*injected smoke generation failure*') { throw 'Smoke generation fault was not exercised' }
+    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $before) { throw 'Failed smoke generation damaged the prior output' }
+    if (@(Wait-ForOwnedWordExit).Count) { throw 'Failed smoke generation left Word running' }
+    $lock = [IO.File]::Open($target, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try { $null = Assert-WordControlFailure smoke --path $target --overwrite --yes }
+    finally { $lock.Dispose() }
+    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $before) { throw 'Smoke publication damaged a locked prior output' }
+    if (@(Wait-ForOwnedWordExit).Count) { throw 'Failed smoke publication left Word running' }
+    $smoke = (Invoke-WordControl smoke --path $target --overwrite --yes) | ConvertFrom-Json
+    if (-not $smoke.ok -or $smoke.cleanup_warning) { throw 'Smoke replacement did not finish cleanly' }
+    if (@(Wait-ForOwnedWordExit).Count) { throw 'Successful smoke replacement left Word running' }
+    $reader = $null; $opened = $null
+    try {
+        $reader = New-Object -ComObject Word.Application
+        $reader.Visible = $false; $reader.DisplayAlerts = 0
+        $opened = $reader.Documents.Open([ref][object][string]$target)
+        if (-not ([string]$opened.Content.Text).StartsWith('Word control smoke test.') -or
+            $opened.Tables.Count -ne 1 -or $opened.OMaths.Count -ne 1 -or
+            $opened.Tables.Item(1).Rows.Count -ne 2 -or $opened.Tables.Item(1).Columns.Count -ne 2 -or
+            [string]$opened.Tables.Item(1).Cell(1,1).Range.Text -ne "A`r$([char]7)" -or
+            [string]$opened.Tables.Item(1).Cell(2,2).Range.Text -ne "2`r$([char]7)") { throw 'Published smoke document failed independent Word readback' }
+    } finally {
+        if ($opened) { $opened.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($opened) }
+        if ($reader) { $reader.Quit([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($reader) }
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+    }
+    if ((Get-FileHash -LiteralPath $Fixture -Algorithm SHA256).Hash -ne $sourceHash) { throw 'Smoke regression changed its original fixture' }
+    if (@(Get-ChildItem -LiteralPath $runDir -Directory -Filter '.word-control-*').Count) { throw 'Smoke staging directories leaked' }
+    if (@(Wait-ForOwnedWordExit).Count) { throw 'Smoke readback left Word running' }
+    return [pscustomobject]@{ ok=$true; generation_failure_preserved_output=$true; locked_output_preserved=$true; published_document_reopened=$true; fixture_hash_unchanged=$true }
+}
+
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
 
 try {
@@ -110,12 +158,15 @@ try {
     $null = Assert-WordControlFailure smoke --path $smokeDoc --yes
 
     $commandIntegration = 'skipped-existing-word-session'
+    $smokeOutputGuards = 'skipped-existing-word-session'
     $saveOutputGuards = 'skipped-existing-word-session'
     if ($wordPidsBefore.Count -eq 0) {
         $smokePids = @(Wait-ForOwnedWordExit)
         if ($smokePids.Count -gt 0) {
             throw "hidden smoke test left Word process(es): $($smokePids -join ', ')"
         }
+        $smokeOutputGuards = Test-SmokeOutputProtection $smokeDoc
+        $smokeOutputGuards | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDir 'smoke-output-guards.json') -Encoding UTF8
         $previousPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
@@ -135,7 +186,7 @@ try {
             throw "isolated integration test left Word process(es): $($newWordPids -join ', ')`n$integrationText"
         }
         $integration = $integrationText | ConvertFrom-Json
-        if (-not $integration.ok -or -not $integration.advanced_tables -or -not $integration.scoped_inspection) {
+        if (-not $integration.ok -or -not $integration.advanced_tables -or -not $integration.scoped_inspection -or -not $integration.cell_text_fidelity) {
             throw 'isolated command integration returned an unsuccessful result'
         }
         $commandIntegration = 'passed'
@@ -227,10 +278,12 @@ try {
         unsupported_equation_rejection = 'passed'
         paragraph_replacement_disabled = 'passed'
         hidden_word_smoke = 'passed'
+        smoke_output_guards = $smokeOutputGuards
         overwrite_guard = 'passed'
         guarded_command_integration = $commandIntegration
         advanced_table_operations = $commandIntegration
         scoped_inspection = $commandIntegration
+        cell_text_fidelity = $commandIntegration
         save_output_guards = $saveOutputGuards
         fixture_document = $fixtureDocument
     } | ConvertTo-Json -Compress -Depth 5
