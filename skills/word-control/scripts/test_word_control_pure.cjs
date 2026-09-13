@@ -772,4 +772,56 @@ test('Backup and PDF publication preserve old outputs through failures and rejec
   assert.equal(race.files.get(target), 'concurrent output', 'No overwrite approval existed for the concurrent output');
 });
 
+test('Smoke preserves old output until a completed save is closed and published', () => {
+  for (const phase of ['startup', 'generation', 'save-cancelled', 'empty', 'publish', 'success']) {
+    const { runtime: r, disk, doc, word, files, folders } = outputGuardRuntime();
+    const target = 'C:\\test\\smoke.docx'; files.set(target, 'previous smoke document');
+    let savedPath, saveCalls = 0, closed = false, quit = false;
+    const table = { Cell() { return {}; } };
+    doc.Content = { End: 5, Text: '' }; doc.Range = () => ({});
+    doc.Tables = { Count: 1, Add() { return table; } }; doc.OMaths = { Count: 1 };
+    doc.Close = () => { closed = true; }; word.Quit = () => { quit = true; };
+    word.Documents.Add = () => doc;
+    r.ActiveXObject = function(name) {
+      if (name === 'Word.Application') {
+        if (phase === 'startup') throw new Error('Word startup failed');
+        return word;
+      }
+      assert.equal(name, 'Scripting.FileSystemObject'); return disk;
+    };
+    r.setCellText = () => {}; r.setBorderCollection = () => [];
+    r.buildEquationInRange = () => {
+      assert.equal(files.get(target), 'previous smoke document', 'Old file was deleted before generation finished');
+      if (phase === 'generation') throw new Error('Equation generation failed');
+    };
+    doc.SaveAs2 = output => {
+      saveCalls++; savedPath = output;
+      files.set(output, phase === 'empty' ? '' : 'completed smoke document');
+      doc.FullName = output; doc.Path = path.win32.dirname(output); doc.Saved = phase !== 'save-cancelled';
+    };
+    doc.SaveAs = () => { throw new Error('Unexpected legacy save fallback'); };
+    doc.Save = () => { throw new Error('Smoke must not trigger an additional save'); };
+    r.moveFailure = (from, to) => {
+      if (from === savedPath) {
+        assert.equal(closed, true, 'Close the saved document before publishing its file');
+        if (phase === 'publish' && to === target) throw new Error('Publication failed');
+      }
+    };
+    r.ARGS = ['smoke', '--path', target, '--overwrite', '--yes'];
+    if (phase === 'success') {
+      r.commandSmoke();
+      assert.equal(r.result.ok, true); assert.equal(r.result.path, target);
+      assert.equal(files.get(target), 'completed smoke document');
+      assert.equal(saveCalls, 1); assert.notEqual(savedPath, target);
+    } else {
+      assert.throws(() => r.commandSmoke(), /smoke test failed/);
+      assert.equal(files.get(target), 'previous smoke document');
+      assert.equal(r.result, undefined);
+    }
+    assert.equal(files.get('C:\\test\\source.docx'), 'original document');
+    assert.equal(folders.size, 1, 'Smoke staging folder leaked');
+    if (phase !== 'startup') assert.equal(quit, true, 'Owned Word instance was not closed');
+  }
+});
+
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));

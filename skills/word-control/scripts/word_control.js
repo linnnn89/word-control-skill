@@ -1732,19 +1732,23 @@ function commandDeleteEquation() {
   emit("{\"ok\":true,\"action\":\"delete-equation\",\"remaining_equations\":" + Number(doc.OMaths.Count) + "}");
 }
 
-function saveAndConfirm(word, doc) {
-  doc.Save();
+function confirmSavedDocument(word, doc) {
   // Save can return after cancellation or while background saving is queued.
   var deadline = new Date().getTime() + 30000;
   while (Number(word.BackgroundSavingStatus) !== 0) {
-    if (new Date().getTime() >= deadline) throw new Error("saving is still pending; document kept open");
+    if (new Date().getTime() >= deadline) throw new Error("saving is still pending");
     WScript.Sleep(100);
   }
-  if (doc.Saved !== true) throw new Error("save was cancelled or could not be confirmed; document kept open");
+  if (doc.Saved !== true) throw new Error("save was cancelled or could not be confirmed");
   var path = safeDocPath(doc);
-  if (!String(doc.Path) || !path) throw new Error("save has no confirmed file path; document kept open");
+  if (!String(doc.Path) || !path) throw new Error("save has no confirmed file path");
   verifyOutputFile(path, false);
   return path;
+}
+
+function saveAndConfirm(word, doc) {
+  doc.Save();
+  return confirmSavedDocument(word, doc);
 }
 
 function commandSaveActive() {
@@ -1851,15 +1855,16 @@ function commandOpen() {
 
 function commandSmoke() {
   requireYes();
-  var path = prepareOutputPath(opt("--path", ""), "smoke");
+  var path = prepareDocumentOutputPath(opt("--path", ""), "smoke");
   if (!/\.docx$/i.test(path)) die("smoke output must use a .docx extension");
-  if (fso.FileExists(path) && hasFlag("--overwrite")) fso.DeleteFile(path, true);
   var word = null;
   var doc = null;
+  var stage = null;
   var tableCount = 0;
   var equationCount = 0;
   var failure = null;
   try {
+    stage = createOutputStage(path);
     word = new ActiveXObject("Word.Application");
     word.Visible = false;
     word.DisplayAlerts = 0;
@@ -1881,9 +1886,12 @@ function commandSmoke() {
     equationCount = Number(doc.OMaths.Count);
     if (tableCount !== 1 || equationCount !== 1) throw new Error("unexpected smoke object counts");
 
-    try { doc.SaveAs2(path); } catch (e1) { doc.SaveAs(path); }
+    // Explicit DOCX format; task-only staging paths must not enter Word's recent files.
+    try { doc.SaveAs2(stage.output, 12, false, "", false); } catch (e1) { doc.SaveAs(stage.output, 12, false, "", false); }
+    if (!sameOutputFile(confirmSavedDocument(word, doc), stage.output)) throw new Error("smoke save changed the expected output path");
     doc.Close(false);
     doc = null;
+    publishOutput(stage, path);
   } catch (e2) {
     failure = e2;
   } finally {
@@ -1897,14 +1905,11 @@ function commandSmoke() {
     }
     try { CollectGarbage(); } catch (e5) {}
   }
-  if (failure !== null) {
-    if (fso.FileExists(path)) {
-      try { fso.DeleteFile(path, true); } catch (e6) {}
-    }
-    die("smoke test failed: " + (failure.message || String(failure)));
-  }
+  var warning = cleanupOutputStage(stage);
+  if (failure !== null) die("smoke test failed: " + (failure.message || String(failure)) + (warning ? "; " + warning : ""));
   emit("{\"ok\":true,\"action\":\"smoke\",\"path\":" + q(path)
-    + ",\"table_count\":" + tableCount + ",\"equation_count\":" + equationCount + "}");
+    + ",\"table_count\":" + tableCount + ",\"equation_count\":" + equationCount
+    + (warning ? ",\"cleanup_warning\":" + q(warning) : "") + "}");
 }
 
 try {
