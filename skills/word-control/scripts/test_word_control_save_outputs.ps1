@@ -249,6 +249,118 @@ function Test-SelectionKindGuards($WordApplication, $ExistingDocument, [string]$
     }
 }
 
+function Test-EquationInputModes($WordApplication, $ExistingDocument, [string]$OutputDirectory) {
+    function Read-TestMath($Document) {
+        $xml=[Xml.XmlDocument]::new(); $xml.PreserveWhitespace=$true
+        $xml.LoadXml([string]$Document.Content.WordOpenXML)
+        $ns=[Xml.XmlNamespaceManager]::new($xml.NameTable)
+        $ns.AddNamespace('m','http://schemas.openxmlformats.org/officeDocument/2006/math')
+        [pscustomobject]@{nodes=$xml.SelectNodes('//m:oMath',$ns);namespaces=$ns}
+    }
+    function Read-EquationScope($Document) {
+        $target=$Document.OMaths.Item(2).Range
+        $end=if ($Document.OMaths.Count -eq 4) { [int]$Document.OMaths.Item(4).Range.Start } else { [int]$Document.Content.End-1 }
+        $math=Read-TestMath $Document
+        $bookmarks=@($Document.Bookmarks | ForEach-Object { @($_.Name,$_.Range.Start,$_.Range.End) })
+        $formats=@(1,3 | ForEach-Object { $eq=$Document.OMaths.Item($_); @($eq.Type,$eq.Range.Font.Name,$eq.Range.Font.Size,$eq.Range.ParagraphFormat.Alignment) })
+        @([string]$Document.Range(0,[int]$target.Start).Text,[string]$Document.Range([int]$target.End,$end).Text,
+          $math.nodes.Item(0).OuterXml,$math.nodes.Item(2).OuterXml,$formats,$bookmarks,
+          [string]$Document.Sections.Item(1).Headers.Item(1).Range.Text,$Document.Range(0,6).Font.Name,$Document.Range(0,6).Font.Bold,
+          $Document.Tables.Count,$Document.Comments.Count,$Document.Revisions.Count,$Document.Sections.Count,
+          $Document.InlineShapes.Count,$Document.Shapes.Count,[bool]$Document.TrackRevisions) | ConvertTo-Json -Depth 8 -Compress
+    }
+    $unicodeBefore=[bool]$WordApplication.CommandBars.GetPressedMso('EquationUnicodeFormat')
+    $latexBefore=[bool]$WordApplication.CommandBars.GetPressedMso('EquationLaTexFormat')
+    if ($unicodeBefore -eq $latexBefore) { throw 'Cannot determine original equation input mode' }
+    $originalMode=if ($unicodeBefore) {'EquationUnicodeFormat'} else {'EquationLaTexFormat'}
+    $existingBefore=Get-DocumentFootprint $ExistingDocument; $existingSaved=[bool]$ExistingDocument.Saved
+    $sample=$null; $verified=0; $trackedVerified=0
+    try {
+        foreach ($mode in 'EquationLaTexFormat','EquationUnicodeFormat') {
+            $sample=$WordApplication.Documents.Add(); $sample.TrackRevisions=$false
+            $sample.Content.Text="prefix`ra^2`rm^2`rz^3`rsuffix`r"
+            $sample.Range(0,6).Font.Bold=$true
+            $sample.Sections.Item(1).Headers.Item(1).Range.Text='Untouched equation header'
+            $sample.Bookmarks.Add('outside_equation_scope',$sample.Range(0,6)) | Out-Null
+            foreach ($start in 15,11,7) {
+                $range=$sample.Range($start,$start+3); $mathRange=$sample.OMaths.Add($range)
+                $mathRange.OMaths.Item(1).BuildUp()
+                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($mathRange)
+                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($range)
+            }
+            $sample.OMaths.Item(2).Range.Font.Size=14
+            $sample.OMaths.Item(2).Range.Font.Color=0x7B3521
+            $path=Join-Path $OutputDirectory ($mode+'.docx')
+            if (Test-Path -LiteralPath $path) { throw 'Equation-mode fixture already exists' }
+            $sample.SaveAs2([ref][object][string]$path,[ref][object]16,[ref][object]$false,[ref][object]'',[ref][object]$false)
+            $sample.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($sample); $sample=$null
+            $sample=$WordApplication.Documents.Open([ref][object][string]$path,[ref][object]$false,[ref][object]$false,[ref][object]$false)
+            $sample.Activate(); $sample.Range(0,0).Select()
+            $WordApplication.CommandBars.ExecuteMso($mode)
+            if (-not $WordApplication.CommandBars.GetPressedMso($mode)) { throw 'Requested initial input mode was not established' }
+            $before=Read-EquationScope $sample; $diskBefore=Read-SharedHash $path
+            $targetType=[int]$sample.OMaths.Item(2).Type
+            $inputFile=Join-Path $OutputDirectory ($mode+'-input.txt')
+            $inspection=Invoke-Bridge @('equations','--index','2')
+            $fingerprint=$inspection.equations[0].fingerprint
+            $cases=@(
+                @('\frac{a+b}{c}','./m:f[string(m:num)="a+b" and string(m:den)="c"]'),
+                @('x^{a_{b}}','./m:sSup[m:e//m:t="x"]/m:sup/m:sSub[m:e//m:t="a" and m:sub//m:t="b"]'),
+                @('x_{a^{b}}','./m:sSub[m:e//m:t="x"]/m:sub/m:sSup[m:e//m:t="a" and m:sup//m:t="b"]'),
+                @('x^{a^{b}}','./m:sSup/m:sup/m:sSup[m:e//m:t="a" and m:sup//m:t="b"]'),
+                @('x^{ab}','./m:sSup/m:sup[m:r/m:t="ab"]'),
+                @('x^{2}y','./m:sSup[m:sup/m:r/m:t="2" and following-sibling::m:r/m:t="y"]'),
+                @('x_{i}y','./m:sSub[m:sub/m:r/m:t="i" and following-sibling::m:r/m:t="y"]')
+            )
+            foreach ($case in $cases) {
+                [IO.File]::WriteAllText($inputFile,$case[0],[Text.UTF8Encoding]::new($false))
+                $result=Invoke-Bridge @('set-equation','--index','2','--input',$inputFile,'--format','latex','--expect-path',$path,'--expect-equation-fingerprint',$fingerprint,'--yes')
+                if (-not $result.ok -or -not $result.fingerprint) { throw 'Equation replacement did not return a usable result' }
+                $math=Read-TestMath $sample; $target=$math.nodes.Item(1)
+                if ($sample.OMaths.Count -ne 3 -or $sample.OMaths.Item(2).Type -ne $targetType -or
+                    $sample.OMaths.Item(2).Range.Font.Size -ne 14 -or $sample.OMaths.Item(2).Range.Font.Color -ne 0x7B3521 -or
+                    $null -eq $target.SelectSingleNode($case[1],$math.namespaces) -or
+                    $target.SelectNodes('.//m:d',$math.namespaces).Count -ne 0) {
+                    [pscustomobject]@{input=$case[0];mode=$mode;equations=$sample.OMaths.Count;math_nodes=$math.nodes.Count;result=$result;math_xml=@($math.nodes | ForEach-Object {$_.OuterXml})} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'equation-failure.json') -Encoding UTF8
+                    throw "Equation grouping differs from requested math: $mode/$($case[0])"
+                }
+                if ((Read-EquationScope $sample) -cne $before -or (Read-SharedHash $path) -ne $diskBefore -or
+                    -not $WordApplication.CommandBars.GetPressedMso($mode) -or $WordApplication.Selection.Start -ne 0 -or $WordApplication.Selection.End -ne 0) { throw 'Equation edit changed protected scope, input mode, selection or source bytes' }
+                $fingerprint=$result.fingerprint; $verified++
+            }
+            $mathBeforeTracking=(Read-TestMath $sample).nodes.Item(1).OuterXml
+            $sample.TrackRevisions=$true
+            [IO.File]::WriteAllText($inputFile,'\frac{p+q}{r}',[Text.UTF8Encoding]::new($false))
+            $result=Invoke-Bridge @('set-equation','--index','2','--input',$inputFile,'--format','latex','--expect-path',$path,'--expect-equation-fingerprint',$fingerprint,'--yes')
+            $math=Read-TestMath $sample
+            if (-not $result.ok -or -not $sample.TrackRevisions -or $sample.Revisions.Count -eq 0 -or $sample.OMaths.Count -ne 3 -or
+                $null -eq $math.nodes.Item(1).SelectSingleNode('./m:f[string(m:num)="p+q" and string(m:den)="r"]',$math.namespaces)) { throw 'Tracked equation replacement did not preserve its revision policy or math' }
+            $sample.Revisions.RejectAll(); $sample.TrackRevisions=$false
+            if ((Read-EquationScope $sample) -cne $before -or (Read-TestMath $sample).nodes.Item(1).OuterXml -cne $mathBeforeTracking) { throw 'Rejecting tracked replacement did not restore the original equation and protected scope' }
+            $trackedVerified++
+            [IO.File]::WriteAllText($inputFile,'(u+v)/w',[Text.UTF8Encoding]::new($false))
+            $result=Invoke-Bridge @('insert-equation','--at','end','--input',$inputFile,'--format','linear','--expect-path',$path,'--yes')
+            $math=Read-TestMath $sample
+            if (-not $result.ok -or $sample.OMaths.Count -ne 4 -or $null -eq $math.nodes.Item(3).SelectSingleNode('./m:f[string(m:num)="u+v" and string(m:den)="w"]',$math.namespaces)) { throw 'Linear equation insertion did not produce a fraction' }
+            if ((Read-EquationScope $sample) -cne $before -or -not $WordApplication.CommandBars.GetPressedMso($mode)) { throw 'Equation insertion changed protected scope or input mode' }
+            $verified++; $mathBefore=@($math.nodes | ForEach-Object {$_.OuterXml}) -join "`n"
+            $null=Invoke-Bridge @('save-active','--expect-path',$path,'--yes')
+            $sample.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($sample); $sample=$null
+            $sample=$WordApplication.Documents.Open([ref][object][string]$path,[ref][object]$false,[ref][object]$false,[ref][object]$false)
+            $math=Read-TestMath $sample
+            if ((Read-EquationScope $sample) -cne $before -or (@($math.nodes | ForEach-Object {$_.OuterXml}) -join "`n") -cne $mathBefore) { throw 'Equation structure or protected scope changed after save/reopen' }
+            $sample.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($sample); $sample=$null
+        }
+    } finally {
+        if ($sample) { $sample.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($sample) }
+        $ExistingDocument.Activate()
+        if (-not $WordApplication.CommandBars.GetPressedMso($originalMode)) { $WordApplication.CommandBars.ExecuteMso($originalMode) }
+        if (-not $WordApplication.CommandBars.GetPressedMso($originalMode)) { throw 'Original equation input mode was not restored' }
+    }
+    if ((Get-DocumentFootprint $ExistingDocument) -cne $existingBefore -or [bool]$ExistingDocument.Saved -ne $existingSaved) { throw 'Independent document state changed' }
+    [pscustomobject]@{ok=$true;initial_modes=2;formulas_verified=$verified;tracked_rejections_verified=$trackedVerified;outside_scope_preserved=$true;input_mode_restored=$true;saved_readback=$true}
+}
+
 function Test-MacroDisabledOpen($WordApplication, $ExistingDocument, [string]$FixturePath, [string]$OutputDirectory) {
     $openSource = Join-Path $OutputDirectory 'open-guard-source.docx'
     if (Test-Path -LiteralPath $openSource) { throw 'Open-security fixture already exists' }
@@ -367,10 +479,11 @@ try {
     if ((Get-DocumentFootprint $doc) -ne $expected) { throw 'Saved/reopened document differs from expected content or structure' }
     $selectionReadback = Test-SelectionReadback $word $doc $Directory
     $selectionKinds = Test-SelectionKindGuards $word $doc $Directory
+    $equationModes = Test-EquationInputModes $word $doc $Directory
     $macroDisabledOpen = Test-MacroDisabledOpen $word $doc $Fixture $Directory
     [pscustomobject]@{ok=$true; word_version=$version; cancellation_events=[WordControlSaveCancellation]::Calls;
         locked_outputs_preserved=2; pdf_paths_rejected=3; source_scope_unchanged=$true; saved_readback=$true; late_close_edit_preserved=$true;
-        macro_disabled_open=$macroDisabledOpen; selection_readback=$selectionReadback; selection_kinds=$selectionKinds} | ConvertTo-Json -Depth 5
+        macro_disabled_open=$macroDisabledOpen; selection_readback=$selectionReadback; selection_kinds=$selectionKinds; equation_input_modes=$equationModes} | ConvertTo-Json -Depth 5
 }
 finally {
     if ($attached) { [void][Runtime.InteropServices.ComEventsHelper]::Remove($word, [WordControlSaveCancellation]::Events, 8, [WordControlSaveCancellation]::Handler) }

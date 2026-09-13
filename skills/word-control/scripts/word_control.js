@@ -672,13 +672,23 @@ function convertLatexCommandWithOneGroup(text, command, prefix, suffix) {
 }
 
 function convertSupSubGroups(text) {
-  text = text.replace(/\^\{([^{}]+)\}/g, function(_, body) {
-    return "^" + (needsGrouping(body) ? "(" + convertLatexToWordLinear(body) + ")" : convertLatexToWordLinear(body));
-  });
-  text = text.replace(/_\{([^{}]+)\}/g, function(_, body) {
-    return "_" + (needsGrouping(body) ? "(" + convertLatexToWordLinear(body) + ")" : convertLatexToWordLinear(body));
-  });
-  return text;
+  var result = "";
+  for (var i = 0; i < text.length; i++) {
+    var ch = text.charAt(i);
+    if ((ch === "^" || ch === "_") && text.charAt(i + 1) === "{") {
+      var close = matchingBrace(text, i + 1);
+      if (close < 0) throw new Error("unbalanced LaTeX script group");
+      var body = convertLatexToWordLinear(text.substring(i + 2, close));
+      // Group nested scripts and terminate the operand before baseline text.
+      // An adjacent sub/superscript must still attach to the same base.
+      if (body) {
+        result += ch + "(" + body + ")";
+        if (text.charAt(close + 1) !== "^" && text.charAt(close + 1) !== "_") result += " ";
+      }
+      i = close;
+    } else result += ch;
+  }
+  return result;
 }
 
 function convertLatexToWordLinear(text) {
@@ -751,13 +761,66 @@ function equationInputText() {
   die("--format must be latex, linear, or word");
 }
 
-function buildEquationInRange(doc, range, linearText) {
+function equationInputMode(commandBars) {
+  var unicode = commandBars.GetPressedMso("EquationUnicodeFormat");
+  var latex = commandBars.GetPressedMso("EquationLaTexFormat");
+  if ((unicode !== true && unicode !== false) || (latex !== true && latex !== false) || unicode === latex) {
+    throw new Error("cannot verify Word equation input mode");
+  }
+  return unicode ? "EquationUnicodeFormat" : "EquationLaTexFormat";
+}
+
+function buildEquationContent(doc, range, linearText) {
   var start = range.Start;
   range.Text = linearText;
   var mathRange = range.Duplicate;
   mathRange.SetRange(start, start + linearText.length);
   var eqRange = doc.OMaths.Add(mathRange);
   eqRange.OMaths(1).BuildUp();
+  return eqRange;
+}
+
+function buildEquationInRange(doc, range, linearText, existingEquation) {
+  var word = doc.Application;
+  var commandBars = doc.Application.CommandBars;
+  var previousMode = equationInputMode(commandBars);
+  var switched = previousMode !== "EquationUnicodeFormat";
+  var eqRange = null, failure = null, restorationError = "", scratch = null, cleanupError = "", scratchName = "";
+  try {
+    if (switched) {
+      commandBars.ExecuteMso("EquationUnicodeFormat");
+      if (equationInputMode(commandBars) !== "EquationUnicodeFormat") throw new Error("Word equation input mode did not become UnicodeMath");
+    }
+    if (existingEquation) {
+      var equationType = Number(existingEquation.Type);
+      if (equationType !== 0 && equationType !== 1) throw new Error("cannot verify the existing equation type");
+      // Rebuilding an existing math zone can retain its old parser behavior.
+      // Removing it in the source would destroy tracked-revision recovery.
+      scratch = word.Documents.Add("", false, 0, false);
+      scratchName = String(scratch.Name);
+      scratch.TrackRevisions = false;
+      scratch.Content.FormattedText = range.FormattedText;
+      if (Number(scratch.OMaths.Count) !== 1) throw new Error("temporary equation scope is not one equation");
+      var scratchRange = scratch.OMaths(1).Range.Duplicate;
+      scratch.OMaths(1).Remove();
+      buildEquationContent(scratch, scratchRange, linearText);
+      if (Number(scratch.OMaths.Count) !== 1) throw new Error("temporary equation build did not produce one equation");
+      var replacement = scratch.OMaths(1);
+      replacement.Type = equationType;
+      if (Number(replacement.Type) !== equationType) throw new Error("temporary equation type was not preserved");
+      range.FormattedText = replacement.Range.FormattedText;
+      eqRange = range;
+    } else eqRange = buildEquationContent(doc, range, linearText);
+  } catch (e) { failure = e; }
+  finally {
+    if (scratch !== null) try { scratch.Close(0); }
+    catch (closeError) { cleanupError = "temporary equation document " + scratchName + " cleanup failed: " + (closeError.message || String(closeError)); }
+    if (switched) try {
+      commandBars.ExecuteMso(previousMode);
+      if (equationInputMode(commandBars) !== previousMode) throw new Error("previous equation input mode was not restored");
+    } catch (restore) { restorationError = "equation input mode restoration failed: " + (restore.message || String(restore)); }
+  }
+  if (failure || cleanupError || restorationError) throw new Error((failure ? failure.message || String(failure) : "equation was built") + (cleanupError ? "; " + cleanupError : "") + (restorationError ? "; " + restorationError : ""));
   return eqRange;
 }
 
@@ -1800,11 +1863,12 @@ function commandSetEquation() {
   var doc = getMutationDocument(word);
   var count = Number(doc.OMaths.Count);
   if (idx > count) die("equation index out of range; document has " + count + " equations");
-  requireFingerprint(equationFingerprint(doc.OMaths(idx)), "--expect-equation-fingerprint", "--allow-unverified-target");
+  var existingEquation = doc.OMaths(idx);
+  requireFingerprint(equationFingerprint(existingEquation), "--expect-equation-fingerprint", "--allow-unverified-target");
   try {
-    var oldRange = doc.OMaths(idx).Range;
+    var oldRange = existingEquation.Range;
     var range = oldRange.Duplicate;
-    buildEquationInRange(doc, range, linearText);
+    buildEquationInRange(doc, range, linearText, existingEquation);
   } catch (e) {
     die("failed to set equation: " + e.message);
   }
