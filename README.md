@@ -28,6 +28,8 @@ Word Control 是一个面向 Windows 桌面版 Microsoft Word 的 Codex 技能�
 
 本技能默认采用保守的安全策略。写操作除了明确确认外，还需要核对当前文档路径；选区、表格和公式操作还会校验刚刚取得的哈希或指纹。已有备份和导出文件默认不会被覆盖，关闭文档也不会退出用户正在使用的 Word。
 
+保存操作会等待后台保存队列完成，并检查 Word 的保存状态和文件是否非空；取消、超时或无法确认时会报错并保留打开的文档。备份与 PDF 先写入目标目录旁的临时目录，生成成功后才替换已有文件；替换失败尝试恢复旧文件，恢复受阻则保留并报告恢复路径。PDF 必须使用独立的 `.pdf` 路径。这些检查不替代内容重读，也不保证断电或进程终止时的原子提交。
+
 ## Requirements
 
 - Windows
@@ -52,7 +54,8 @@ skills/word-control/
     |-- word_control.js
     |-- test_word_control.ps1
     |-- test_word_control_integration.js
-    `-- test_word_control_pure.cjs
+    |-- test_word_control_pure.cjs
+    `-- test_word_control_save_outputs.ps1
 ```
 
 ## Installation
@@ -111,6 +114,8 @@ Scratch `--output` files must use `.json`, `.txt`, `.tsv`, or `.log`, must diffe
 The test runs pure regression checks, creates a separate hidden Word instance and temporary DOCX, exercises text, table, equation, save-copy, and PDF operations, and validates every JSON output with a strict parser. Scoped-query tests cover paragraph pages, regular and merged tables, summary guard omission, and unchanged document/selection state. It removes its own artifacts. If Word is already running, command integration is skipped; a skipped result is not a complete validation.
 
 XML acceptance uses independent before/after COM reads of story text, object counts, bookmarks and table formatting, together with selection/save state. Border acceptance checks non-border state and boundaries outside the target and its shared neighbors. These tests cover the exercised scope; a stable XML snapshot does not establish complete document or effective-formatting equivalence. Upstream risk references and scope requirements are recorded in the maintenance guide.
+
+Save/output acceptance includes native Word save cancellation without macros, exclusive locks on existing backup/PDF files, independent source-state and byte checks, and save/close/reopen, including an edit introduced during the close event. Fault-injection regressions also cover a Save call returning with unsaved state, pending/unreadable state, failed generation, publication and restoration, and destination races. Recovery files are preserved when restoration fails. See the [save/export guide](skills/word-control/references/usage.md#save-export-and-close) for failure and interruption semantics.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\skills\word-control\scripts\test_word_control.ps1"

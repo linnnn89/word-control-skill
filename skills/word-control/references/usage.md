@@ -156,7 +156,15 @@ cscript //nologo $wc export-pdf --path "<preview.pdf>" --expect-path "<doc>" --y
 cscript //nologo $wc close-active --save --expect-path "<doc>" --yes
 ```
 
-Use exactly one of `--save` or `--discard` with `close-active`. It closes only the verified active document and never quits Word.
+Use exactly one of `--save` or `--discard` with `close-active`. It closes only the verified active document and never quits Word. After save confirmation, `--save` still passes Word's `wdSaveChanges` when closing so an edit introduced by a close event is not discarded; `--discard` uses `wdDoNotSaveChanges`.
+
+`save-active` and `close-active --save` wait up to 30 seconds for Word's background-save queue to empty, then require `Document.Saved == true` and an existing nonempty file. A save error, cancellation, unreadable state or pending-save timeout returns a nonzero exit; the command does not proceed to close. The 30-second limit covers queue polling, not a blocked COM call or visible save dialog. These checks confirm Word's reported state and file presence, not storage durability or a full content readback. Reopen and compare the affected scope when the task needs that assurance.
+
+`save-copy` and `export-pdf` generate into an exclusively created `.word-control-*.tmp` directory beside the destination. They require nonempty output; PDF also requires a `%PDF-` header. Only then is an approved existing output moved to `previous.<extension>` and the new file moved into place. A publication error attempts to restore the old file. If restoration is blocked, the error reports the exact retained recovery file; preserve it for inspection. A successful publication with failed cleanup reports `cleanup_warning` and the retained directory. Do not blindly retry after a missing response.
+
+This is a recoverable sequence of same-volume moves, not an atomic or crash-durable transaction: interruption between moves may leave the final path absent and the old file in the staging directory. Prefer new versioned backup names. This sequence uses existing WSH/FSO capabilities and does not add a process or runtime dependency.
+
+PDF destinations must end in `.pdf` and differ from the active source, including case and Windows 8.3 aliases. Backup/export paths must be literal file paths without wildcards, alternate streams or trailing dots/spaces. `save-copy` does not change the source format; its disk-copy fallback remains limited to a saved document with unchanged identity and no pending save. It never silently saves unsaved changes to make a backup possible.
 
 ## Troubleshooting
 

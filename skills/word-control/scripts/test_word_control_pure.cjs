@@ -600,4 +600,124 @@ test('XML comparison is bounded, optional, and cannot replace a live mutation gu
   } finally { Object.assign(context, original); }
 });
 
+function outputGuardRuntime() {
+  const files = new Map([['C:\\test\\source.docx', 'original document']]);
+  const folders = new Set(['C:\\test']);
+  const runtime = { WScript: { Arguments: [], Echo() {}, Sleep() {},
+    StdErr: { WriteLine(value) { runtime.lastError = value; } },
+    Quit(code) { throw new Error(runtime.lastError || 'Exit ' + code); } } };
+  const disk = {
+    GetAbsolutePathName: value => path.win32.resolve(value),
+    GetParentFolderName: value => path.win32.dirname(value),
+    GetExtensionName: value => path.win32.extname(value).slice(1),
+    BuildPath: (parent, name) => path.win32.join(parent, name),
+    GetTempName: () => 'guard.tmp',
+    FileExists: value => files.has(value), FolderExists: value => folders.has(value),
+    GetFile(value) { if (!files.has(value)) throw new Error('Missing file'); return { Size: files.get(value).length, ShortPath: value }; },
+    CreateFolder(value) { assert.equal(folders.has(value), false); folders.add(value); },
+    GetFolder(value) { return { Files: { Count: [...files.keys()].filter(p => path.win32.dirname(p) === value).length }, SubFolders: { Count: 0 } }; },
+    DeleteFolder(value) { assert.equal(disk.GetFolder(value).Files.Count, 0); folders.delete(value); },
+    DeleteFile(value) { files.delete(value); },
+    CopyFile(from, to, overwrite) { assert.ok(files.has(from)); assert.equal(overwrite, false); assert.equal(files.has(to), false); files.set(to, files.get(from)); },
+    MoveFile(from, to) {
+      if (runtime.moveFailure) runtime.moveFailure(from, to);
+      if (files.has(to) || folders.has(to)) throw new Error('Destination exists');
+      assert.ok(files.has(from)); files.set(to, files.get(from)); files.delete(from);
+    },
+    OpenTextFile(value) { return { Read: count => files.get(value).slice(0, count), Close() {} }; },
+  };
+  runtime.ActiveXObject = function(name) { assert.equal(name, 'Scripting.FileSystemObject'); return disk; };
+  vm.createContext(runtime);
+  vm.runInContext(source, runtime);
+  runtime.emit = text => { runtime.result = JSON.parse(text); };
+  const doc = { FullName: 'C:\\test\\source.docx', Path: 'C:\\test', Saved: false, Save() {}, Close(mode) { runtime.closed = true; runtime.closeMode = mode; } };
+  const word = { Documents: { Count: 1 }, ActiveDocument: doc, BackgroundSavingStatus: 0 };
+  runtime.getWord = () => word;
+  return { runtime, files, folders, disk, doc, word };
+}
+
+test('Save and close keep the document open when saving cannot be confirmed', () => {
+  for (const command of ['save-active', 'close-active']) {
+    for (const state of ['cancelled', 'unreadable', 'missing-file', 'throwing-save', 'background-error', 'pending']) {
+      const { runtime: r, doc, files, word } = outputGuardRuntime();
+      r.ARGS = [command, '--yes', '--save', '--expect-path', doc.FullName];
+      if (state === 'unreadable') Object.defineProperty(doc, 'Saved', { get() { throw new Error('Saved unavailable'); } });
+      if (state === 'missing-file') { doc.Save = () => { doc.Saved = true; }; files.clear(); }
+      if (state === 'throwing-save') doc.Save = () => { throw new Error('Save failed'); };
+      if (state === 'background-error') { doc.Saved = true; Object.defineProperty(word, 'BackgroundSavingStatus', { get() { throw new Error('Queue unavailable'); } }); }
+      if (state === 'pending') {
+        let now = 0; r.Date = class { getTime() { return now; } };
+        r.WScript.Sleep = ms => { now += ms; }; doc.Saved = true; word.BackgroundSavingStatus = 1;
+      }
+      assert.throws(() => command === 'save-active' ? r.commandSaveActive() : r.commandCloseActive(), /save|saving|Saved|Queue|missing or empty/i);
+      assert.equal(r.closed, undefined, state + ' closed the document');
+      assert.equal(r.result, undefined, state + ' reported success');
+    }
+  }
+  const { runtime: r, doc } = outputGuardRuntime();
+  doc.Save = () => { doc.Saved = true; };
+  r.ARGS = ['close-active', '--save', '--yes', '--expect-path', doc.FullName];
+  r.commandCloseActive();
+  assert.equal(r.closed, true);
+  assert.equal(r.closeMode, -1, 'Close must retain save semantics for edits after the save check');
+  assert.equal(r.result.saved, 'true', 'Preserve the existing result type');
+});
+
+test('Backup and PDF publication preserve old outputs through failures and reject unsafe paths', () => {
+  for (const command of ['save-copy', 'export-pdf']) {
+    for (const phase of ['generation', 'empty', 'old-move', 'publish', 'restore', 'success']) {
+      const { runtime: r, doc, files, folders } = outputGuardRuntime();
+      const target = command === 'save-copy' ? 'C:\\test\\backup.docx' : 'C:\\test\\preview.pdf';
+      files.set(target, 'old output');
+      const generate = output => {
+        assert.equal(files.get(target), 'old output', 'Old output was removed before generation');
+        files.set(output, phase === 'empty' ? '' : (command === 'export-pdf' ? '%PDF-new output' : 'new document'));
+        if (phase === 'generation') throw new Error('Generation failed');
+      };
+      doc.SaveCopyAs = generate; doc.ExportAsFixedFormat = generate;
+      r.moveFailure = (from, to) => {
+        if (phase === 'old-move' && from === target) throw new Error('Old output locked');
+        if ((phase === 'publish' || phase === 'restore') && to === target && path.win32.basename(from).startsWith('new.')) throw new Error('Publication failed');
+        if (phase === 'restore' && to === target && path.win32.basename(from).startsWith('previous.')) throw new Error('Recovery blocked');
+      };
+      r.ARGS = [command, '--path', target, '--overwrite', '--yes', '--expect-path', doc.FullName];
+      const invoke = () => command === 'save-copy' ? r.commandSaveCopy() : r.commandExportPdf();
+      if (phase === 'success') {
+        invoke(); assert.equal(r.result.ok, true); assert.notEqual(files.get(target), 'old output');
+      } else {
+        assert.throws(invoke, /failed|empty|saved|recovery|publication/i);
+        assert.equal(r.result, undefined);
+        if (phase === 'restore') {
+          const recovery = [...files.entries()].find(([name, value]) => name !== target && value === 'old output');
+          assert.ok(recovery, 'The prior output must survive even if rollback is blocked');
+          assert.ok(r.lastError.includes(recovery[0]), 'Report the precise recovery file');
+        } else { assert.equal(files.get(target), 'old output'); }
+      }
+      assert.equal(files.get(doc.FullName), 'original document');
+      assert.equal(doc.Saved, false);
+      if (phase !== 'restore') assert.equal(folders.size, 1, 'Staging folder leaked');
+    }
+  }
+  for (const target of ['C:\\test\\source.docx', 'C:\\test\\source.docx:preview.pdf', 'C:\\test\\*.pdf', 'C:\\test\\preview.pdf.']) {
+    const { runtime: r, doc, files } = outputGuardRuntime();
+    doc.ExportAsFixedFormat = () => { throw new Error('Unexpected Word export'); };
+    r.ARGS = ['export-pdf', '--path', target, '--overwrite', '--yes', '--expect-path', doc.FullName];
+    assert.throws(() => r.commandExportPdf(), /\.pdf|literal|path/i);
+    assert.equal(files.get(doc.FullName), 'original document');
+  }
+  const { runtime: r, doc, files, disk } = outputGuardRuntime();
+  doc.FullName = 'C:\\test\\source.pdf'; files.set(doc.FullName, 'source PDF');
+  r.ARGS = ['export-pdf', '--path', 'C:\\test\\SOURCE.pdf', '--overwrite', '--yes', '--expect-path', doc.FullName];
+  assert.throws(() => r.commandExportPdf(), /differ/);
+  const alias = 'C:\\test\\SOURCE~1.pdf'; files.set(alias, 'source PDF');
+  disk.GetFile = () => ({ Size: 10, ShortPath: alias });
+  r.ARGS = ['save-copy', '--path', alias, '--overwrite', '--yes', '--expect-path', doc.FullName];
+  assert.throws(() => r.commandSaveCopy(), /differ/);
+  const race = outputGuardRuntime(), target = 'C:\\test\\race.pdf';
+  race.doc.ExportAsFixedFormat = output => { race.files.set(output, '%PDF-generated'); race.files.set(target, 'concurrent output'); };
+  race.runtime.ARGS = ['export-pdf', '--path', target, '--yes', '--expect-path', race.doc.FullName];
+  assert.throws(() => race.runtime.commandExportPdf(), /overwrite/);
+  assert.equal(race.files.get(target), 'concurrent output', 'No overwrite approval existed for the concurrent output');
+});
+
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));

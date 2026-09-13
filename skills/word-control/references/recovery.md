@@ -18,6 +18,9 @@
 - Merged table has unknown row/column counts: inspect full `linear_cells` and use `set-cell --cell`. Do not force structural row/column operations on an irregular table.
 - `selection is collapsed`: select the intended text; use `--allow-insert` only for intended cursor insertion.
 - Backup fails with unsaved changes: do not silently save or use an older disk copy. Obtain the user's decision unless the existing request already authorizes the necessary action.
+- Save is cancelled, pending or cannot be confirmed: leave the document open, inspect Word's save state and resolve the cause before retrying. Never follow a failed save with `close-active --discard` to finish a save request.
+- Backup/PDF publication or restoration fails: inspect the final path and any reported `previous.<extension>` recovery file. Preserve the old content and resolve the file lock or access error before restoring; never overwrite a concurrent output blindly. After interruption, check the destination's `.word-control-*.tmp` directories before retrying.
+- Output reports `cleanup_warning`: publication succeeded but temporary/recovery files remain at the reported path. Verify the final output before removing those files; the warning is not a request to regenerate the output.
 - Word dialog blocks automation: have the visible dialog resolved; do not dismiss it or close the user's session automatically.
 - Non-ASCII console text is corrupted: use UTF-8 input and `--output` files.
 - Missing response or nonzero exit: inspect the current target before retrying. A failure after writing may leave changed content; report any `failures` or rollback failures. This bridge has no durable operation receipts.

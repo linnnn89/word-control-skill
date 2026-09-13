@@ -24,6 +24,8 @@ For discovery, use `find-text` in the relevant story, bounded paragraph pages or
 
 For acceptance, compare before/after state across the affected scope: the target, shared cell boundaries or neighboring content, and relevant document structure. A verified mutation result covers the command's own checks; it does not establish unchanged formatting, bookmarks or layout everywhere else. Reuse its guard while performing any additional checks required by the task, and investigate unexpected differences before saving or continuing dependent edits.
 
+For save/backup/export failures, also compare the source file, existing destination, document content and save/open state. Save commands require an empty background-save queue, a saved document and a nonempty file; this is not a substitute for content readback. Preserve any reported recovery file or cleanup warning. Prefer a new backup name, and do not discard or close the document after a failed save.
+
 ## Non-Negotiable Guards
 
 - Require `--expect-path` for saved documents. Use `--expect-name` only for an intentionally unsaved document.
