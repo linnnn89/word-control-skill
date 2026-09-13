@@ -187,7 +187,18 @@ function exerciseAdvancedTable(path, tableIndex, fingerprint, prefix) {
   assertTrue(Number(table.Borders(-1).LineStyle) === 1, "outer table border style readback failed");
   assertTrue(Number(table.Cell(2, 2).Borders(-1).LineStyle) === 0, "cell top border removal readback failed");
   assertTrue(Number(table.Cell(2, 2).Borders(-3).LineStyle) === 7, "cell bottom double border readback failed");
-  return String(removedTop.fingerprint);
+  var normalized = runJson([
+    "normalize-table-borders", "--table", String(tableIndex), "--expect-table-fingerprint", String(removedTop.fingerprint),
+    "--color", "D9DEE8", "--line-width", "4", "--expect-path", path, "--yes"
+  ], prefix + "-advanced-normalize-borders.json");
+  var results = [outerBorders, innerBorders, cellBorders, removedTop, normalized];
+  for (var i = 0; i < results.length; i++) {
+    assertTrue(results[i].applied === true && results[i].verified === true && results[i].inspection_complete === true, "border result was not verified");
+    assertTrue(results[i].errors.length === 0 && results[i].failure_count === 0, "successful border result contains errors");
+    assertTrue(String(results[i].document.path).toLowerCase() === path.toLowerCase(), "border result lost document identity");
+  }
+  assertTrue(Number(table.Cell(2, 2).Borders(-1).LineStyle) === 1 && Number(table.Cell(2, 2).Borders(-1).LineWidth) === 4, "normalized cell border readback failed");
+  return String(normalized.fingerprint);
 }
 
 var bridge = fso.GetAbsolutePathName(opt("--bridge"));
@@ -446,6 +457,7 @@ function runFixture(path) {
   ], "fixture-create-table.json");
   var testTableIndex = tableCount + 1;
   assertTrue(createdTable.ok && createdTable.table_count === testTableIndex, "fixture table creation count mismatch");
+  assertTrue(createdTable.applied === true && createdTable.fill_complete === true && createdTable.verified === true, "fixture table creation was not verified");
   var advancedTableFingerprint = exerciseAdvancedTable(path, testTableIndex, createdTable.fingerprint, "fixture");
   var deletedTable = runJson([
     "delete-table", "--table", String(testTableIndex), "--expect-table-fingerprint", advancedTableFingerprint,
@@ -592,6 +604,7 @@ try {
     "create-table", "--rows", "3", "--cols", "3", "--input", tableInput, "--at", "end", "--expect-path", docPath, "--yes"
   ], "create-table.json");
   assertTrue(createdTable.ok && String(createdTable.fingerprint).length === 8, "guarded table creation failed");
+  assertTrue(createdTable.applied === true && createdTable.fill_complete === true && createdTable.verified === true, "table creation was not verified");
 
   var tables = runJson(["tables"], "tables.json");
   assertTrue(tables.table_count === 1, "table inspection count mismatch");

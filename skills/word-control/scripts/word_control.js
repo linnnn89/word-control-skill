@@ -354,7 +354,7 @@ function applyBordersAtomically(borders, borderTypes, color, lineWidth, lineStyl
       });
     } catch (e1) {
       failures.push("capture:" + borderTypes[i] + ":" + (e1.message || String(e1)));
-      return { failures: failures, rollbackFailures: rollbackFailures, rolledBack: true };
+      return { failures: failures, rollbackFailures: rollbackFailures, rolledBack: true, applied: false };
     }
   }
   for (var j = 0; j < borderTypes.length; j++) {
@@ -382,7 +382,8 @@ function applyBordersAtomically(borders, borderTypes, color, lineWidth, lineStyl
   return {
     failures: failures,
     rollbackFailures: rollbackFailures,
-    rolledBack: failures.length > 0 && rollbackFailures.length === 0
+    rolledBack: failures.length > 0 && rollbackFailures.length === 0,
+    applied: failures.length ? null : true
   };
 }
 
@@ -429,8 +430,12 @@ function tableFingerprint(table, readErrors) {
       var cell = cells(i);
       var shading = "?";
       var texture = "?";
-      try { shading = String(Number(cell.Shading.BackgroundPatternColor)); } catch (e5) { errors.push("cell[" + i + "]-shading:" + e5.message); }
-      try { texture = String(Number(cell.Shading.Texture)); } catch (e6) { errors.push("cell[" + i + "]-texture:" + e6.message); }
+      var cellShading = null;
+      try { cellShading = cell.Shading; shading = String(Number(cellShading.BackgroundPatternColor)); } catch (e5) { errors.push("cell[" + i + "]-shading:" + e5.message); }
+      try {
+        if (cellShading === null) cellShading = cell.Shading;
+        texture = String(Number(cellShading.Texture));
+      } catch (e6) { errors.push("cell[" + i + "]-texture:" + e6.message); }
       formatting.push("c" + i + ":" + shading + ":" + texture + ":" + borderSignature(cell.Borders, [-1, -2, -3, -4], errors, "cell[" + i + "]-borders"));
     }
   } catch (e7) { errors.push("fingerprint-cells:" + e7.message); }
@@ -440,6 +445,12 @@ function tableFingerprint(table, readErrors) {
     return null;
   }
   return textHash(rows + "x" + cols + "|" + text + "|" + formatting.join("|"));
+}
+
+// Post-check failures must not replace errors from a write or its rollback.
+function postWriteTableFingerprint(table, errors) {
+  try { return tableFingerprint(table, errors); }
+  catch (e) { errors.push("fingerprint:" + (e.message || String(e))); return null; }
 }
 
 function equationFingerprint(equation, readErrors) {
@@ -1116,16 +1127,50 @@ function commandCreateTable() {
   } else {
     range = requireExpectedSelection(word, true).range;
   }
-  var table;
+  var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var table = null, tableCount = null, applied = null, fillComplete = parsed ? false : null;
+  var errors = [], fingerprint = null;
   try {
     table = doc.Tables.Add(range, rows, cols);
+    applied = true;
   } catch (e) {
-    die("failed to create table: " + e.message);
+    errors.push("create:" + (e.message || String(e)));
   }
-  if (parsed) fillTableFromTsv(table, parsed);
-  emit("{\"ok\":true,\"action\":\"create-table\",\"table_count\":" + Number(doc.Tables.Count)
+  if (table) {
+    if (parsed) {
+      try { fillTableFromTsv(table, parsed); fillComplete = true; }
+      catch (fillError) { errors.push("fill:" + (fillError.message || String(fillError))); }
+    }
+    if (!parsed || fillComplete) {
+      try {
+        if (Number(table.Rows.Count) !== rows || Number(table.Columns.Count) !== cols) {
+          throw new Error("table dimensions differ from requested dimensions");
+        }
+        if (parsed) {
+          for (var r = 0; r < parsed.rows.length && r < rows; r++) {
+            for (var c = 0; c < parsed.rows[r].length && c < cols; c++) {
+              var raw = String(table.Cell(r + 1, c + 1).Range.Text);
+              if (!/\r\x07$/.test(raw) || normalizeText(raw.substring(0, raw.length - 2)) !== normalizeText(parsed.rows[r][c])) {
+                throw new Error("cell[" + (r + 1) + "," + (c + 1) + "] differs from requested text");
+              }
+            }
+          }
+        }
+      } catch (readError) { errors.push("readback:" + (readError.message || String(readError))); }
+    }
+    fingerprint = postWriteTableFingerprint(table, errors);
+  }
+  try { tableCount = Number(doc.Tables.Count); }
+  catch (countError) { errors.push("table-count:" + (countError.message || String(countError))); }
+  var verified = applied === true && errors.length === 0 && fingerprint !== null;
+  var payload = "{\"ok\":" + boolJson(verified) + ",\"action\":\"create-table\",\"table_count\":" + tableCount
     + ",\"rows\":" + rows + ",\"cols\":" + cols + ",\"truncated\":" + boolJson(truncated)
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    + ",\"document\":" + documentJson + ",\"applied\":" + (applied === null ? "null" : boolJson(applied))
+    + ",\"fill_complete\":" + (fillComplete === null ? "null" : boolJson(fillComplete))
+    + ",\"verified\":" + boolJson(verified) + ",\"inspection_complete\":" + boolJson(verified)
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
+  emit(payload);
 }
 
 function commandSetCell() {
@@ -1383,16 +1428,21 @@ function commandSetBorders(scope) {
     target = resolveTableCell(table, "--cell", "--row", "--col", "border target");
     borders = target.cell.Borders;
   }
+  var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
   var result = applyBordersAtomically(borders, edges.types, color, lineWidth, lineStyle);
-  var payload = "{\"ok\":" + boolJson(result.failures.length === 0) + ",\"action\":" + q("set-" + scope + "-borders")
+  var errors = [], fingerprint = postWriteTableFingerprint(table, errors);
+  var verified = result.failures.length === 0 && result.rollbackFailures.length === 0 && errors.length === 0 && fingerprint !== null;
+  var payload = "{\"ok\":" + boolJson(verified) + ",\"action\":" + q("set-" + scope + "-borders")
     + ",\"table\":" + tableIndex + ",\"target\":" + (target ? cellTargetJson(target) : "null")
     + ",\"edges\":" + stringArrayJson(edges.names) + ",\"style\":" + q(styleName) + ",\"line_style\":" + lineStyle
     + ",\"color\":" + (colorHex ? q(colorHex) : "null") + ",\"width_points\":" + (widthText ? q(widthText) : "null")
     + ",\"line_width\":" + (lineStyle !== 0 ? lineWidth : "null")
     + ",\"failure_count\":" + result.failures.length + ",\"failures\":" + stringArrayJson(result.failures)
     + ",\"rolled_back\":" + boolJson(result.rolledBack) + ",\"rollback_failures\":" + stringArrayJson(result.rollbackFailures)
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}";
-  if (result.failures.length) failJson(payload, 3);
+    + ",\"document\":" + documentJson + ",\"applied\":" + (result.applied === null ? "null" : boolJson(result.applied))
+    + ",\"verified\":" + boolJson(verified) + ",\"inspection_complete\":" + boolJson(verified)
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
   emit(payload);
 }
 
@@ -1429,8 +1479,10 @@ function commandNormalizeTableBorders() {
   var cellBorderTypes = [-1, -2, -3, -4];
   var cellCount = 0;
   var failures = [];
+  var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
 
-  failures = failures.concat(setBorderCollection(table.Borders, tableBorderTypes, color, lineWidth, "table"));
+  try { failures = failures.concat(setBorderCollection(table.Borders, tableBorderTypes, color, lineWidth, "table")); }
+  catch (tableError) { failures.push("table:" + (tableError.message || String(tableError))); }
   try { table.Borders.Enable = true; } catch (e1) { failures.push("table-enable:" + (e1.message || String(e1))); }
 
   try {
@@ -1446,15 +1498,19 @@ function commandNormalizeTableBorders() {
     failures.push("cell-enumeration:" + (e3.message || String(e3)));
   }
 
-  var payload = "{\"ok\":" + boolJson(failures.length === 0) + ",\"action\":\"normalize-table-borders\",\"table\":" + tableIndex
+  var errors = [], fingerprint = postWriteTableFingerprint(table, errors);
+  var verified = failures.length === 0 && errors.length === 0 && fingerprint !== null;
+  var payload = "{\"ok\":" + boolJson(verified) + ",\"action\":\"normalize-table-borders\",\"table\":" + tableIndex
     + ",\"tables\":" + tableCount
     + ",\"cells_seen\":" + cellCount
     + ",\"failure_count\":" + failures.length
     + ",\"failures\":" + stringArrayJson(failures)
     + ",\"color\":" + q(colorHex)
     + ",\"line_width\":" + lineWidth
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}";
-  if (failures.length) failJson(payload, 3);
+    + ",\"document\":" + documentJson + ",\"applied\":" + (failures.length ? "null" : "true")
+    + ",\"verified\":" + boolJson(verified) + ",\"inspection_complete\":" + boolJson(verified)
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
   emit(payload);
 }
 
