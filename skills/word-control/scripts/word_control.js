@@ -921,11 +921,18 @@ function commandHelp() {
   ].join("\n"));
 }
 
+function readSelectionText(word) {
+  var selection = word.Selection;
+  // Word's Selection.Text returns the next character even at an insertion point.
+  if (Number(selection.Start) === Number(selection.End)) return "";
+  return normalizeText(selection.Text);
+}
+
 function commandStatus() {
   var word = getWord();
   var docs = Number(word.Documents.Count);
   var selectionText = "";
-  try { selectionText = String(word.Selection.Text); } catch (e1) {}
+  try { selectionText = readSelectionText(word); } catch (e1) {}
   var docPart = "null";
   var selectionPart = "null";
   if (docs > 0) docPart = activeDocJson(word, word.ActiveDocument);
@@ -946,7 +953,7 @@ function commandSelection() {
   var word = getWord();
   getActiveDocument(word);
   var text = "";
-  try { text = normalizeText(word.Selection.Text); } catch (e) { die("cannot read current selection: " + e.message); }
+  try { text = readSelectionText(word); } catch (e) { die("cannot read current selection: " + e.message); }
   emit(text);
 }
 

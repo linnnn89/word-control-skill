@@ -75,6 +75,30 @@ test('Identical text and coordinates in a different story are rejected', () => {
   assert.throws(() => context.requireExpectedSelection({ Selection: { Range: range } }, false), /expect-story-type/);
 });
 
+test('Selection text and status do not expose the next character at an insertion point', () => {
+  const original = { getWord: context.getWord, emit: context.emit };
+  try {
+    for (const collapsed of [true, false]) {
+      let textReads = 0, result;
+      const text = collapsed ? '' : 'Alpha\r';
+      const range = { Text: text, Start: 0, End: text.length, StoryType: 1 };
+      const selection = { Range: range, Start: range.Start, End: range.End,
+        get Text() { textReads++; return collapsed ? 'A' : text; } };
+      const doc = { Name: 'source.docx', FullName: 'C:\\test\\source.docx', Saved: true, TrackRevisions: false, ReadOnly: false, ProtectionType: -1 };
+      context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc, Version: '16.0', Selection: selection });
+      context.emit = value => { result = value; };
+      context.commandSelection();
+      assert.equal(result, collapsed ? '' : 'Alpha\n', 'An insertion point must not be reported as selected text');
+      context.commandStatus();
+      const status = JSON.parse(result);
+      assert.equal(status.selection_text_length, text.length);
+      assert.equal(status.selection.text_length, status.selection_text_length);
+      assert.equal(status.selection.collapsed, collapsed);
+      assert.equal(textReads, collapsed ? 0 : 2, 'Read native selection text only when a nonempty range is selected');
+    }
+  } finally { Object.assign(context, original); }
+});
+
 test('A saved document cannot be verified by filename alone', () => {
   context.ARGS = ['save-active', '--expect-name', 'report.docx'];
   assert.throws(() => context.requireExpectedDocument({ Name: 'report.docx', Path: 'C:\\other', FullName: 'C:\\other\\report.docx' }), /saved documents require/);
