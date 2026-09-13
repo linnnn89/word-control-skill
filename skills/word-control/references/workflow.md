@@ -4,7 +4,7 @@ Work directly in the verified active Word document. Read the relevant command-gu
 
 New-document generation and whole-document reconstruction are outside this skill's scope.
 
-For discovery, use bounded paragraph pages or table summaries. For reading table values, use `tables --detail text`. Before editing, inspect only the target in full. Full inspection of every table still reads every cell and its guarded formatting; use it when the task actually needs that scope.
+For discovery, use `find-text` in the relevant story, bounded paragraph pages or table summaries. For table values, use `tables --detail text`, with `--table`, `--cell-from` and `--cell-max` when only a cell range matters. Use `equations --index N` for one formula. Before editing, inspect only the target in full. Full inspection of every table still reads every cell and its guarded formatting; use it when the task actually needs that scope.
 
 `document-text` reads Word's main text story, and `--at end` uses its end. Endnotes can render after that point: inspect notes separately when they are relevant, and verify the visible insertion location instead of inferring the last rendered page from the range offset.
 
@@ -15,10 +15,10 @@ For discovery, use bounded paragraph pages or table summaries. For reading table
 3. Inspect the exact target immediately before mutation:
    - Text or comments: run `selection-info` and retain `story_type`, `start`, `end`, and `text_hash`.
    - Tables: run `tables --table N` in full detail and retain the target table's `fingerprint`.
-   - Equations: run `equations` and retain the target equation's `fingerprint`.
+   - Equations: run `equations --index N` and retain the target equation's `fingerprint`.
 4. Put non-ASCII input in a task-local UTF-8 file. Use an isolated temporary folder, not the document's source folder unless necessary.
 5. Execute one narrow mutation with `--yes`, the expected document path or name, and the fresh selection or object fingerprint.
-6. Re-run the relevant read-only inspection, targeting the changed table when applicable. A table or equation fingerprint changes after a successful edit, so inspect again before another mutation.
+6. Verify the result. A successful `set-cell` with `verified:true`, matching document/target, `readback.matches_requested:true` and a non-null fingerprint already includes actual text readback and full post-write inspection; reuse this fresh fingerprint for the next operation without an extra full query. The next mutation still recomputes the live fingerprint. Otherwise re-run the relevant target inspection. Reinspect for additional scope or visual evidence, and never reuse a failed or incomplete result.
 7. Save, close, or export only when the user requested it. Never quit the user's Word application.
 8. Remove task-only JSON, TXT, TSV, and probe artifacts. Preserve source documents, backups, and requested review outputs.
 

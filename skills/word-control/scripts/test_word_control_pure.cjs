@@ -217,19 +217,32 @@ test('Failed reads stay unknown and equation text/fingerprints share one snapsho
   assert.equal(result.equations[1].inspection_complete, false);
   assert.match(result.equations[1].read_errors[0], /unavailable/);
   assert.equal(result.equations[2].text, 'x\n');
+  reads.fill(0);
+  context.ARGS = ['equations', '--index', '3'];
+  context.commandEquations();
+  assert.deepEqual(reads, [0, 0, 1]);
+  assert.equal(result.equation_count, 3);
+  assert.equal(result.returned, 1);
+  assert.equal(result.equations[0].index, 3);
+  context.ARGS = ['equations', '--index', '4'];
+  assert.throws(() => context.commandEquations(), /out of range/);
 });
 
 test('Single-table inspection is bounded and read-only detail cannot supply mutation fingerprints', () => {
   let summaryOnly = false;
   let textOnly = false;
+  let allowedCells = null;
   const border = { LineStyle: 1, LineWidth: 4, Color: 0 };
   const makeTable = label => {
     const items = Array.from({ length: 4 }, (_, index) => ({
+      RowIndex: index < 2 ? 1 : 2, ColumnIndex: index % 2 + 1,
       get Range() { assert.equal(summaryOnly, false, 'Summary read a cell'); return { Text: label + index + '\r\x07' }; },
       get Shading() { assert.equal(summaryOnly || textOnly, false, 'Read-only detail read shading'); return { BackgroundPatternColor: 0, Texture: 0 }; },
       Borders() { assert.equal(summaryOnly || textOnly, false, 'Read-only detail read cell borders'); return border; },
     }));
-    const cells = index => { assert.equal(summaryOnly, false, 'Summary enumerated cells'); return items[index - 1]; };
+    const cells = index => { assert.equal(summaryOnly, false, 'Summary enumerated cells');
+      if (allowedCells) assert.ok(allowedCells.includes(index), 'Read an unrequested cell');
+      return items[index - 1]; };
     cells.Count = items.length;
     return { Rows: { Count: 2 }, Columns: { Count: 2 },
       Range: { Cells: cells, get Text() { assert.equal(summaryOnly, false, 'Summary read table text'); return label + '\r\x07'; } },
@@ -270,6 +283,21 @@ test('Single-table inspection is bounded and read-only detail cannot supply muta
   assert.throws(() => context.requireFingerprint(result.tables[0].fingerprint, '--expect-table-fingerprint', '--allow-unverified-target'), /incomplete/);
   textOnly = false;
 
+  textOnly = true; allowedCells = [3];
+  context.ARGS = ['tables', '--table', '2', '--detail', 'text', '--cell-from', '3', '--cell-max', '1'];
+  context.commandTables();
+  assert.equal(result.tables[0].cell_count, 4);
+  assert.equal(result.tables[0].returned_cells, 1);
+  assert.equal(result.tables[0].next_cell, 4);
+  assert.deepEqual(result.tables[0].linear_cells[0], { index: 3, row: 2, col: 1, text: 'second2' });
+  assert.equal(result.tables[0].layout, 'unverified');
+  assert.equal(result.tables[0].fingerprint, null);
+  context.ARGS = ['tables', '--table', '2', '--detail', 'text', '--cell-from', '5'];
+  context.commandTables();
+  assert.equal(result.tables[0].returned_cells, 0);
+  assert.equal(result.tables[0].next_cell, null);
+  allowedCells = null; textOnly = false;
+
   summaryOnly = true; visited.length = 0;
   context.ARGS = ['tables', '--table', '2', '--detail', 'summary'];
   context.commandTables();
@@ -295,10 +323,115 @@ test('Single-table inspection is bounded and read-only detail cannot supply muta
     [['--table', '4'], /out of range/],
     [['--table', '0'], /positive integer/],
     [['--detail', 'brief'], /full, text or summary/],
+    [['--cell-from', '1'], /requires --table and --detail text/],
+    [['--table', '2', '--cell-max', '2'], /requires --table and --detail text/],
+    [['--table', '2', '--detail', 'text', '--cell-max', '201'], /<= 200/],
   ]) {
     context.ARGS = ['tables', ...args];
     assert.throws(() => context.commandTables(), message);
   }
+});
+
+test('Set-cell reports verified readback or an explicit unverified write without a reusable guard', () => {
+  const original = { readUtf8: context.readUtf8, tableFingerprint: context.tableFingerprint };
+  let result, value, mode, fingerprints;
+  const range = { End: 10, get Text() { return value + '\r\x07'; }, set Text(input) {
+    value = mode === 'mismatch' ? 'unexpected' : input.replace(/\r\n|\n/g, '\r');
+    if (mode === 'write-error') throw new Error('Write interrupted');
+  } };
+  const table = { Rows: { Count: 1 }, Columns: { Count: 1 }, Cell: () => ({ Range: range }) };
+  const tables = () => table; tables.Count = 1;
+  const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', Tables: tables };
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+  context.readUtf8 = () => '中文\r\nsecond\n';
+  context.tableFingerprint = () => {
+    fingerprints++;
+    if (fingerprints > 1 && mode === 'fingerprint-error') throw new Error('Format unreadable');
+    return fingerprints === 1 ? 'before' : 'after';
+  };
+  context.emit = output => { result = JSON.parse(output); };
+  try {
+    for (mode of ['success', 'mismatch', 'fingerprint-error', 'write-error']) {
+      value = 'old'; fingerprints = 0; result = null; context.lastError = '';
+      context.ARGS = ['set-cell', '--table', '1', '--row', '1', '--col', '1', '--input', 'input.txt',
+        '--expect-path', doc.FullName, '--expect-table-fingerprint', 'before', '--yes'];
+      if (mode === 'success') {
+        context.commandSetCell();
+        assert.equal(result.verified, true);
+        assert.equal(result.applied, true);
+        assert.equal(result.readback.matches_requested, true);
+        assert.equal(result.readback.text_hash, context.textHash('中文\nsecond\n'));
+        assert.equal(result.fingerprint, 'after');
+        assert.equal(result.document.path, doc.FullName);
+        assert.equal(fingerprints, 2, 'Reuse the existing post-write fingerprint');
+      } else {
+        assert.throws(() => context.commandSetCell());
+        assert.equal(result.ok, false);
+        assert.equal(result.verified, false);
+        assert.equal(result.fingerprint, null);
+        assert.equal(result.inspection_complete, false);
+        assert.ok(result.errors.length);
+        assert.equal(result.applied, mode === 'write-error' ? null : true);
+        if (mode === 'mismatch') assert.equal(result.readback.matches_requested, false);
+      }
+    }
+  } finally { Object.assign(context, original); }
+});
+
+test('Literal search keeps story offsets and restores Find settings on success and partial failure', () => {
+  const read = context.readUtf8;
+  const settings = { Text: 'user query', MatchCase: false, MatchWholeWord: true, MatchWildcards: true,
+    MatchSoundsLike: false, MatchAllWordForms: false, Forward: false, Wrap: 1, Format: true,
+    MatchByte: true, MatchFuzzy: false, MatchPrefix: true, MatchSuffix: true, IgnoreSpace: true, IgnorePunct: true };
+  const initial = { ...settings };
+  let result, query = 'needle', searches = 0, failAfterFirst = false;
+  function range(text, start = 0, end = text.length) {
+    const value = { Start: start, End: end, SetRange(a, b) { this.Start = a; this.End = b; },
+      get Text() { return text.slice(this.Start, this.End); }, get Duplicate() { return range(text, this.Start, this.End); } };
+    const finder = { Execute() {
+      searches++;
+      if (failAfterFirst && searches > 1) throw new Error('Find interrupted');
+      assert.equal(settings.Wrap, 0); assert.equal(settings.Format, false);
+      assert.equal(settings.MatchWildcards, false); assert.equal(settings.MatchCase, true);
+      const literal = settings.Text.replace(/\^\^/g, '^');
+      const found = text.indexOf(literal, value.Start);
+      if (found < 0 || found + literal.length > value.End) return false;
+      value.Start = found; value.End = found + literal.length; return true;
+    } };
+    for (const key of Object.keys(settings)) Object.defineProperty(finder, key, { get: () => settings[key], set: v => { settings[key] = v; } });
+    value.Find = finder; return value;
+  }
+  const doc = { Name: 'query.docx', FullName: 'C:\\test\\query.docx', Content: range('A needle B needle C ^p\r'),
+    Footnotes: { Count: 0 }, Endnotes: { Count: 1 }, StoryRanges: () => range('note needle\r') };
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+  context.emit = output => { result = JSON.parse(output); };
+  context.readUtf8 = () => query;
+  try {
+    context.ARGS = ['find-text', '--input', 'query.txt', '--max', '1', '--context', '2'];
+    context.commandFindText();
+    assert.equal(result.matches[0].start, 2); assert.equal(result.matches[0].end, 8);
+    assert.equal(result.matches[0].context, 'A needle B');
+    assert.equal(result.has_more, true); assert.equal(result.next_from, 8);
+    assert.deepEqual(settings, initial);
+    context.ARGS.push('--from', '8');
+    context.commandFindText();
+    assert.equal(result.matches[0].start, 11); assert.equal(result.has_more, false);
+    context.ARGS = ['find-text', '--input', 'query.txt', '--story', 'endnotes'];
+    context.commandFindText();
+    assert.equal(result.story_type, 3); assert.equal(result.matches[0].start, 5);
+    context.ARGS = ['find-text', '--input', 'query.txt', '--story', 'footnotes'];
+    context.commandFindText();
+    assert.equal(result.story_available, false); assert.equal(result.returned, 0);
+    query = '^p'; context.ARGS = ['find-text', '--input', 'query.txt'];
+    context.commandFindText();
+    assert.equal(result.matches[0].text, '^p'); assert.equal(result.matches[0].start, 20);
+    query = 'needle'; searches = 0; failAfterFirst = true; context.lastError = '';
+    assert.throws(() => context.commandFindText());
+    assert.equal(result.ok, false); assert.equal(result.returned, 1);
+    assert.equal(result.has_more, null); assert.equal(result.next_from, null);
+    assert.equal(result.inspection_complete, false); assert.match(result.read_errors[0], /interrupted/);
+    assert.deepEqual(settings, initial, 'Failed search must restore user Find settings');
+  } finally { context.readUtf8 = read; }
 });
 
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));

@@ -6,6 +6,9 @@
 - `target fingerprint changed`: inspect that table with `tables --table N` or rerun `equations`. An index alone is not an identity guarantee.
 - `table index out of range`: refresh `tables --detail summary` before selecting an index; document edits can change indices.
 - `--table` with `--max`: choose either a single table or a prefix of the collection.
+- Cell pagination requires `--table` and `--detail text`; its linear indices refer to the current table, including merged cells. Follow `next_cell` only when `read_errors` is empty and the document has not changed.
+- `find-text` has no matches: check `story`, `story_available`, case-sensitive literal input and `from` before concluding text is absent. Headers, footers and text boxes are outside this query's scope. A failed Find-settings restoration is an error, not a successful read.
+- `set-cell` returns `verified:false`: inspect its `applied`, `readback` and `errors`. `applied:true` means the write completed but verification failed; `applied:null` means a thrown write may already have changed the document. No reusable fingerprint is returned. Inspect before retrying and do not assume rollback.
 - Summary/text mode has no fingerprint: request full detail for the specific table. This is an intentional omission, not a failed COM read.
 - Paragraph/equation has `text:null` and `read_errors`: the read failed; keep that content unknown and re-read the affected scope after resolving the error. An `ok:true` envelope can contain partial inspection results.
 - Full inspection has `fingerprint:null`, `inspection_complete:false` or `read_errors`: do not mutate from that result. Resolve the read failure and inspect again.
