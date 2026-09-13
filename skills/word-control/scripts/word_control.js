@@ -807,21 +807,40 @@ function getMutationDocument(word) {
 }
 
 function selectionSnapshot(word) {
-  var range = word.Selection.Range;
-  var text = normalizeText(range.Text);
+  var selection = word.Selection;
+  var selectionType = Number(selection.Type);
+  if (!isFinite(selectionType) || selectionType < 0 || selectionType !== Math.floor(selectionType)) throw new Error("cannot verify selection type");
+  var range = selection.Range;
+  var start = Number(range.Start), end = Number(range.End);
+  // Word's COM empty text can fail ADODB.WriteText; use a literal at the cursor.
+  var text = start === end ? "" : normalizeText(range.Text);
+  var supported = selectionType === 1 || selectionType === 2;
+  if (selectionType === 4 || selectionType === 5 || (selectionType === 2 && text.indexOf("\x07") >= 0)) {
+    var cellCount = Number(range.Cells.Count);
+    if (!isFinite(cellCount) || cellCount < 0 || cellCount !== Math.floor(cellCount)) throw new Error("cannot verify selection cell count");
+    supported = false;
+    if (cellCount === 1) {
+      var cellRange = range.Cells(1).Range;
+      supported = Number(cellRange.Start) === start && Number(cellRange.End) === end;
+    }
+  }
   return {
     range: range,
+    selectionType: selectionType,
+    rangeEditSupported: supported,
     storyType: Number(range.StoryType),
-    start: Number(range.Start),
-    end: Number(range.End),
-    collapsed: Number(range.Start) === Number(range.End),
+    start: start,
+    end: end,
+    collapsed: start === end,
     text: text,
-    hash: textHash(text)
+    hash: textHash("selection-type:" + selectionType + "\n" + text)
   };
 }
 
 function selectionSnapshotJson(snapshot) {
   return "{"
+    + "\"selection_type\":" + snapshot.selectionType + ","
+    + "\"range_edit_supported\":" + boolJson(snapshot.rangeEditSupported) + ","
     + "\"story_type\":" + snapshot.storyType + ","
     + "\"start\":" + snapshot.start + ","
     + "\"end\":" + snapshot.end + ","
@@ -833,6 +852,7 @@ function selectionSnapshotJson(snapshot) {
 
 function requireExpectedSelection(word, allowCollapsed) {
   var snapshot = selectionSnapshot(word);
+  if (!snapshot.rangeEditSupported) die("unsupported selection range (type " + snapshot.selectionType + "); select contiguous text or one complete cell; use cell-targeted table commands for multiple cells");
   if (snapshot.collapsed && !allowCollapsed && !hasFlag("--allow-insert")) {
     die("selection is collapsed; pass --allow-insert only when insertion at the cursor is intended");
   }
@@ -851,7 +871,7 @@ function requireExpectedSelection(word, allowCollapsed) {
     die("selection end changed; rerun selection-info before mutating");
   }
   if (expectedHash && String(expectedHash).toLowerCase() !== snapshot.hash) {
-    die("selection text changed; rerun selection-info before mutating");
+    die("selection text or type changed; rerun selection-info before mutating");
   }
   return snapshot;
 }
@@ -921,40 +941,38 @@ function commandHelp() {
   ].join("\n"));
 }
 
-function readSelectionText(word) {
-  var selection = word.Selection;
-  // Word's Selection.Text returns the next character even at an insertion point.
-  if (Number(selection.Start) === Number(selection.End)) return "";
-  return normalizeText(selection.Text);
-}
-
 function commandStatus() {
   var word = getWord();
   var docs = Number(word.Documents.Count);
-  var selectionText = "";
-  try { selectionText = readSelectionText(word); } catch (e1) {}
+  var selectionLength = docs > 0 ? null : 0, selectionError = "";
   var docPart = "null";
   var selectionPart = "null";
   if (docs > 0) docPart = activeDocJson(word, word.ActiveDocument);
   if (docs > 0) {
-    try { selectionPart = selectionSnapshotJson(selectionSnapshot(word)); } catch (e2) {}
+    try {
+      var snapshot = selectionSnapshot(word);
+      selectionPart = selectionSnapshotJson(snapshot);
+      if (snapshot.rangeEditSupported) selectionLength = snapshot.text.length;
+    } catch (e) { selectionError = e.message || String(e); }
   }
   emit("{"
     + "\"ok\":true,"
     + "\"word_version\":" + q(word.Version) + ","
     + "\"documents_count\":" + docs + ","
     + "\"active_document\":" + docPart + ","
-    + "\"selection_text_length\":" + normalizeText(selectionText).length + ","
+    + "\"selection_text_length\":" + (selectionLength === null ? "null" : selectionLength) + ","
     + "\"selection\":" + selectionPart
+    + (selectionError ? ",\"selection_read_error\":" + q(selectionError) : "")
     + "}");
 }
 
 function commandSelection() {
   var word = getWord();
   getActiveDocument(word);
-  var text = "";
-  try { text = readSelectionText(word); } catch (e) { die("cannot read current selection: " + e.message); }
-  emit(text);
+  var snapshot;
+  try { snapshot = selectionSnapshot(word); } catch (e) { die("cannot read current selection: " + e.message); }
+  if (!snapshot.rangeEditSupported) die("unsupported selection range (type " + snapshot.selectionType + "); inspect table cells or select contiguous text");
+  emit(snapshot.text);
 }
 
 function commandSelectionInfo() {

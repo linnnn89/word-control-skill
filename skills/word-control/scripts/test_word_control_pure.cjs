@@ -65,14 +65,14 @@ test('LaTeX validates original tokens and braces', () => {
 });
 
 const range = { Start: 0, End: 4, Text: 'same', StoryType: 1 };
-const selection = context.selectionSnapshot({ Selection: { Range: range } });
+const selection = context.selectionSnapshot({ Selection: { Range: range, Type: 2 } });
 const guards = ['--expect-story-type', '1', '--expect-start', '0', '--expect-end', '4', '--expect-selection-hash', selection.hash];
 test('Identical text and coordinates in a different story are rejected', () => {
   context.ARGS = ['replace-selection', ...guards];
-  assert.throws(() => context.requireExpectedSelection({ Selection: { Range: { ...range, StoryType: 7 } } }, false), /story changed/);
-  assert.equal(context.requireExpectedSelection({ Selection: { Range: range } }, false).hash, selection.hash);
+  assert.throws(() => context.requireExpectedSelection({ Selection: { Range: { ...range, StoryType: 7 }, Type: 2 } }, false), /story changed/);
+  assert.equal(context.requireExpectedSelection({ Selection: { Range: range, Type: 2 } }, false).hash, selection.hash);
   context.ARGS = ['replace-selection', ...guards.slice(2)];
-  assert.throws(() => context.requireExpectedSelection({ Selection: { Range: range } }, false), /expect-story-type/);
+  assert.throws(() => context.requireExpectedSelection({ Selection: { Range: range, Type: 2 } }, false), /expect-story-type/);
 });
 
 test('Selection text and status do not expose the next character at an insertion point', () => {
@@ -82,7 +82,7 @@ test('Selection text and status do not expose the next character at an insertion
       let textReads = 0, result;
       const text = collapsed ? '' : 'Alpha\r';
       const range = { Text: text, Start: 0, End: text.length, StoryType: 1 };
-      const selection = { Range: range, Start: range.Start, End: range.End,
+      const selection = { Range: range, Type: collapsed ? 1 : 2, Start: range.Start, End: range.End,
         get Text() { textReads++; return collapsed ? 'A' : text; } };
       const doc = { Name: 'source.docx', FullName: 'C:\\test\\source.docx', Saved: true, TrackRevisions: false, ReadOnly: false, ProtectionType: -1 };
       context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc, Version: '16.0', Selection: selection });
@@ -94,7 +94,7 @@ test('Selection text and status do not expose the next character at an insertion
       assert.equal(status.selection_text_length, text.length);
       assert.equal(status.selection.text_length, status.selection_text_length);
       assert.equal(status.selection.collapsed, collapsed);
-      assert.equal(textReads, collapsed ? 0 : 2, 'Read native selection text only when a nonempty range is selected');
+      if (collapsed) assert.equal(textReads, 0, 'Do not read the character following an insertion point');
     }
   } finally { Object.assign(context, original); }
 });
@@ -109,7 +109,7 @@ test('Failed tracked replacement restores previous tracking state', () => {
   const doc = { Name: 'test.docx', FullName: 'C:\\test\\test.docx', TrackRevisions: false };
   const target = { ...range };
   Object.defineProperty(target, 'Text', { get() { return 'same'; }, set() { throw new Error('Protected range'); } });
-  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc, Selection: { Range: target } });
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc, Selection: { Range: target, Type: 2 } });
   context.readUtf8 = () => 'changed';
   context.ARGS = ['replace-selection', '--yes', '--track', '--expect-path', doc.FullName, ...guards];
   assert.throws(() => context.commandReplaceSelection(), /Protected range/);
@@ -117,6 +117,68 @@ test('Failed tracked replacement restores previous tracking state', () => {
   doc.TrackRevisions = true;
   assert.throws(() => context.commandReplaceSelection(), /Protected range/);
   assert.equal(doc.TrackRevisions, true);
+});
+
+test('Selection mutations refuse ambiguous kinds before writing and invalidate guards after a kind change', () => {
+  const original = { getWord: context.getWord, readUtf8: context.readUtf8, emit: context.emit, buildEquationInRange: context.buildEquationInRange };
+  function args(snapshot) {
+    return ['--expect-story-type', String(snapshot.storyType), '--expect-start', String(snapshot.start),
+      '--expect-end', String(snapshot.end), '--expect-selection-hash', snapshot.hash];
+  }
+  try {
+    for (const [type, count, cellStart] of [[4, 7, 0], [5, 3, 0], [6, 0, 0], [3, 0, 0], [7, 0, 0], [8, 0, 0], [0, 0, 0], [2, 7, 0], [2, 1, 2]]) {
+      for (const command of ['replace-selection', 'insert-comment', 'create-table', 'insert-equation']) {
+        let writes = 0;
+        const cellRange = { Start: cellStart, End: 20 };
+        const cells = () => ({ Range: cellRange }); cells.Count = count;
+        const target = { Start: 0, End: 20, StoryType: 1, Cells: cells,
+          get Text() { return 'cell\r\x07cell\r\x07'; }, set Text(value) { writes++; } };
+        const doc = { Name: 'source.docx', FullName: 'C:\\test\\source.docx', TrackRevisions: false,
+          Comments: { Add() { writes++; } }, Tables: { Add() { writes++; } } };
+        const word = { Documents: { Count: 1 }, ActiveDocument: doc, Selection: { Range: target, Type: type } };
+        let output;
+        context.getWord = () => word; context.readUtf8 = () => 'replacement'; context.emit = value => { output = value; };
+        context.buildEquationInRange = () => { writes++; };
+        const snapshot = context.selectionSnapshot(word);
+        assert.throws(() => context.commandSelection(), /unsupported selection range/, 'A raw selection read must not silently return part of a special selection');
+        context.commandStatus();
+        const status = JSON.parse(output);
+        assert.equal(status.selection_text_length, null);
+        assert.equal(status.selection.range_edit_supported, false);
+        context.ARGS = [command, '--input', 'input.txt', '--format', 'linear', '--rows', '1', '--cols', '1', '--at', 'selection',
+          '--expect-path', doc.FullName, '--yes', '--track', '--allow-unverified-selection', ...args(snapshot)];
+        const run = () => ({ 'replace-selection': context.commandReplaceSelection, 'insert-comment': context.commandInsertComment,
+          'create-table': context.commandCreateTable, 'insert-equation': context.commandInsertEquation })[command]();
+        assert.throws(run, /unsupported selection range/, 'Ambiguous selection must be refused before mutation');
+        assert.equal(writes, 0); assert.equal(doc.TrackRevisions, false);
+        assert.equal(snapshot.rangeEditSupported, false);
+      }
+    }
+    const cellRange = { Start: 0, End: 5 };
+    const cells = () => ({ Range: cellRange }); cells.Count = 1;
+    const target = { ...cellRange, StoryType: 1, Text: 'cell\r\x07', Cells: cells };
+    const word = { Selection: { Range: target, Type: 4 } };
+    const snapshot = context.selectionSnapshot(word);
+    context.ARGS = ['replace-selection', ...args(snapshot)];
+    assert.equal(context.requireExpectedSelection(word, false).rangeEditSupported, true, 'A complete single cell remains supported');
+    word.Selection.Type = 2;
+    assert.equal(context.selectionSnapshot(word).rangeEditSupported, true);
+    assert.throws(() => context.requireExpectedSelection(word, false), /selection text or type changed/);
+    word.Selection.Type = NaN;
+    assert.throws(() => context.selectionSnapshot(word), /selection type/);
+    word.Selection.Type = 4; cells.Count = NaN;
+    assert.throws(() => context.selectionSnapshot(word), /selection cell count/);
+    let output;
+    context.getWord = () => ({ Documents: { Count: 0 }, Version: '16.0', get Selection() { throw new Error('No selection without a document'); } });
+    context.emit = value => { output = JSON.parse(value); };
+    context.commandStatus();
+    assert.equal(output.selection_text_length, 0); assert.equal(output.selection, null);
+    context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: { Name: 'source.docx' }, Version: '16.0',
+      Selection: { get Type() { throw new Error('Selection interface unreadable'); } } });
+    context.commandStatus();
+    assert.equal(output.selection_text_length, null); assert.equal(output.selection, null);
+    assert.match(output.selection_read_error, /Selection interface unreadable/);
+  } finally { Object.assign(context, original); }
 });
 
 test('Incomplete formatting inspection has no reusable fingerprint', () => {
