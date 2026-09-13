@@ -267,6 +267,83 @@ function exerciseVerifiedCellResults() {
   } finally { bridge = originalBridge; sample.Close(false); doc.Activate(); }
 }
 
+function exerciseStructureResults() {
+  var sample = word.Documents.Add(), originalBridge = bridge;
+  function cellFormat(cell) {
+    var font = cell.Range.Font, shade = cell.Shading, values = [font.Name, font.Size, font.Bold, font.Italic, font.Color,
+      shade.BackgroundPatternColor, shade.ForegroundPatternColor, shade.Texture];
+    for (var edge = 1; edge <= 4; edge++) {
+      var border = cell.Borders(-edge); values.push(border.LineStyle, border.LineWidth, border.Color);
+    }
+    return values.join("|");
+  }
+  try {
+    sample.Content.Text = "before\rafter\r";
+    sample.Sections(1).Headers(1).Range.Text = "untouched header";
+    sample.Bookmarks.Add("outside_structure", sample.Range(0, 6));
+    var table = sample.Tables.Add(sample.Range(7, 7), 3, 3), formats = {};
+    for (var r = 1; r <= 3; r++) for (var c = 1; c <= 3; c++) {
+      var range = table.Cell(r, c).Range; range.End--; range.Text = "R" + r + "C" + c;
+    }
+    table.Cell(1, 1).Range.Font.Bold = -1;
+    table.Cell(3, 3).Shading.BackgroundPatternColor = 16315114;
+    var samplePath = fso.BuildPath(testDir, "verified-structure-results.docx"); sample.SaveAs2(samplePath);
+    sample.Close(false); sample = word.Documents.Open(samplePath); sample.Activate(); table = sample.Tables(1);
+    for (var r0 = 1; r0 <= 3; r0++) for (var c0 = 1; c0 <= 3; c0++) formats["R" + r0 + "C" + c0] = cellFormat(table.Cell(r0, c0));
+    var before = captureInspectionFootprint(sample, table, false);
+    var prefixBefore = String(sample.Range(0, table.Range.Start).Text), suffixBefore = String(sample.Range(table.Range.End, sample.Content.End).Text);
+    var source = readUtf8(bridge), needle = "function tableFingerprint(table, readErrors) {";
+    assertTrue(source.indexOf(needle) >= 0, "Structural final-inspection injection point missing");
+    var faultBridge = fso.BuildPath(testDir, "structure-final-inspection-failure.js");
+    writeUtf8(faultBridge, source.replace(needle, "var injectedPostChecks = 0;\n" + needle
+      + "\n  if (++injectedPostChecks === 2) { if (readErrors) readErrors.push('injected incomplete structural inspection'); return null; }"));
+    var cases = [["insert-row", true, false], ["delete-row", true, true], ["insert-column", false, false], ["delete-column", false, true]];
+    for (var i = 0; i < cases.length; i++) {
+      var command = cases[i][0], rowAxis = cases[i][1], deleting = cases[i][2];
+      // Deletion fixtures contain an explicitly seeded empty line; recovery never recreates deleted user text.
+      if (deleting) {
+        if (rowAxis) table.Rows.Add(table.Rows(2)); else table.Columns.Add(table.Columns(2));
+      }
+      var guard = runJson(["tables", "--table", "1"], command + "-structure-before.json").tables[0].fingerprint;
+      var option = deleting ? (rowAxis ? "--row" : "--col") : "--before";
+      var output = fso.BuildPath(testDir, command + "-structure-failure.json"), outcome;
+      bridge = faultBridge;
+      try {
+        outcome = requireFailure([command, "--table", "1", option, "2", "--expect-path", samplePath,
+          "--expect-table-fingerprint", guard, "--yes", "--output", output]);
+      } finally { bridge = originalBridge; }
+      var result = parseJsonFile(output);
+      var expectedRows = !deleting && rowAxis ? 4 : 3, expectedCols = !deleting && !rowAxis ? 4 : 3;
+      assertTrue(outcome.code === 3 && !result.ok && result.applied === true && !result.verified && !result.inspection_complete
+        && result.fingerprint === null && result.readback.matches_requested === true
+        && result.rows === expectedRows && result.cols === expectedCols && result.errors.join(" ").indexOf("injected") >= 0,
+        "Incomplete structural result concealed its write or returned a reusable guard");
+      assertTrue(String(result.document.path).toLowerCase() === samplePath.toLowerCase(), "Structural failure lost document identity");
+      assertTrue(Number(table.Rows.Count) === expectedRows && Number(table.Columns.Count) === expectedCols, "Structural result disagreed with real Word dimensions");
+      for (var row = 1; row <= expectedRows; row++) for (var col = 1; col <= expectedCols; col++) {
+        var blank = !deleting && (rowAxis ? row === 2 : col === 2);
+        var originalRow = !deleting && rowAxis && row > 2 ? row - 1 : row;
+        var originalCol = !deleting && !rowAxis && col > 2 ? col - 1 : col;
+        var expectedText = blank ? "" : "R" + originalRow + "C" + originalCol;
+        assertTrue(String(table.Cell(row, col).Range.Text) === expectedText + "\r\x07", "Structural edit moved or lost unrelated cell text");
+        if (!blank) assertTrue(cellFormat(table.Cell(row, col)) === formats[expectedText], "Structural edit changed surviving cell formatting");
+      }
+      assertTrue(String(sample.Range(0, table.Range.Start).Text) === prefixBefore
+        && String(sample.Range(table.Range.End, sample.Content.End).Text) === suffixBefore, "Structural edit changed surrounding text");
+      if (!deleting) {
+        var fresh = runJson(["tables", "--table", "1"], command + "-structure-recovery-guard.json").tables[0].fingerprint;
+        var restored = runJson([rowAxis ? "delete-row" : "delete-column", "--table", "1", rowAxis ? "--row" : "--col", "2",
+          "--expect-path", samplePath, "--expect-table-fingerprint", fresh, "--yes"], command + "-structure-restored.json");
+        assertTrue(restored.applied && restored.verified && restored.inspection_complete && restored.readback.matches_requested
+          && restored.errors.length === 0 && restored.fingerprint, "Verified structural result was not reusable");
+      }
+      assertTrue(captureInspectionFootprint(sample, table, false) === before, "Structural round trip changed stories, objects, bookmarks or formatting");
+    }
+    sample.Save(); sample.Close(false); sample = word.Documents.Open(samplePath); sample.Activate();
+    assertTrue(captureInspectionFootprint(sample, sample.Tables(1), false) === before, "Structural scenario changed after save and reopen");
+  } finally { bridge = originalBridge; sample.Close(false); doc.Activate(); }
+}
+
 function exerciseXmlNormalization() {
   // Exercise the shipped normalizer in real MSXML, without substituting a different XML parser.
   var source = readUtf8(bridge);
@@ -400,6 +477,13 @@ function exerciseAdvancedTable(path, tableIndex, fingerprint, prefix) {
     "--col", "2", "--expect-path", path, "--yes"
   ], prefix + "-advanced-delete-column.json");
   assertTrue(deletedColumn.rows === 3 && deletedColumn.cols === 3, "column deletion dimension mismatch");
+  var structureResults = [insertedRow, deletedRow, insertedColumn, deletedColumn];
+  for (var structureIndex = 0; structureIndex < structureResults.length; structureIndex++) {
+    var structureResult = structureResults[structureIndex];
+    assertTrue(structureResult.applied && structureResult.verified && structureResult.inspection_complete && structureResult.readback.matches_requested
+      && structureResult.errors.length === 0 && String(structureResult.document.path).toLowerCase() === path.toLowerCase(),
+      "Structural result was not verified before reuse");
+  }
 
   var shading = runJson([
     "set-cell-shading", "--table", String(tableIndex), "--expect-table-fingerprint", String(deletedColumn.fingerprint),
@@ -473,7 +557,7 @@ var word = null;
 var doc = null;
 var failure = null;
 var savedWordOptions = {};
-var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"cell_text_fidelity":true,"verified_cell_results":true,"backup":true,"pdf":true,"close":true}';
+var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"cell_text_fidelity":true,"verified_cell_results":true,"verified_structure_results":true,"backup":true,"pdf":true,"close":true}';
 
 function exerciseScopedInspection() {
   var queryDoc = word.Documents.Add();
@@ -829,6 +913,7 @@ try {
   exerciseXmlMutationDetection();
   exerciseCellTextFidelity();
   exerciseVerifiedCellResults();
+  exerciseStructureResults();
 
   word.Selection.SetRange(0, 4);
   runJson(["paragraphs"], "control-character-paragraphs.json");

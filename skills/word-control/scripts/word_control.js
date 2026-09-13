@@ -1450,6 +1450,34 @@ function commandSwapCellText() {
   emit(payload);
 }
 
+function emitTableStructureResult(table, contextJson, expectedRows, expectedCols, applied, errors) {
+  // Post-write reads must retain the operation state instead of exiting through a preflight helper.
+  var rows = null, cols = null;
+  try {
+    var rowCount = Number(table.Rows.Count);
+    if (!isFinite(rowCount) || rowCount < 1 || rowCount !== Math.floor(rowCount)) throw new Error("invalid row count");
+    rows = rowCount;
+  } catch (rowError) { errors.push("readback:rows:" + (rowError.message || String(rowError))); }
+  try {
+    var colCount = Number(table.Columns.Count);
+    if (!isFinite(colCount) || colCount < 1 || colCount !== Math.floor(colCount)) throw new Error("invalid column count");
+    cols = colCount;
+  } catch (colError) { errors.push("readback:cols:" + (colError.message || String(colError))); }
+  var matches = rows === null || cols === null ? null : rows === expectedRows && cols === expectedCols;
+  if (matches === false) errors.push("readback:dimension readback mismatch");
+  var fingerprint = postWriteTableFingerprint(table, errors);
+  var verified = applied === true && matches === true && errors.length === 0 && fingerprint !== null;
+  var payload = "{\"ok\":" + boolJson(verified) + "," + contextJson
+    + ",\"rows\":" + (rows === null ? "null" : rows) + ",\"cols\":" + (cols === null ? "null" : cols)
+    + ",\"applied\":" + (applied === null ? "null" : boolJson(applied)) + ",\"verified\":" + boolJson(verified)
+    + ",\"inspection_complete\":" + boolJson(verified) + ",\"readback\":{\"matches_requested\":" + (matches === null ? "null" : boolJson(matches))
+    + ",\"expected_rows\":" + expectedRows + ",\"expected_cols\":" + expectedCols + "}"
+    + (matches === false ? ",\"error\":\"dimension readback mismatch\"" : "")
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+  if (!verified) failJson(payload, 3);
+  emit(payload);
+}
+
 function commandInsertRow() {
   requireYes();
   var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
@@ -1463,19 +1491,15 @@ function commandInsertRow() {
   var dimensions = getRegularTableDimensions(table, "insert-row");
   var before = beforeText ? parsePositiveInt(beforeText, "--before") : 0;
   if (before > dimensions.rows) die("--before row is out of range; table has " + dimensions.rows + " rows");
+  var contextJson = "\"action\":\"insert-row\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
+    + ",\"at_end\":" + boolJson(atEnd) + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, errors = [];
   try {
     if (atEnd) table.Rows.Add();
     else table.Rows.Add(table.Rows(before));
-  } catch (e) {
-    die("failed to insert row: " + e.message);
-  }
-  var after = getRegularTableDimensions(table, "insert-row readback");
-  if (after.rows !== dimensions.rows + 1 || after.cols !== dimensions.cols) {
-    failJson("{\"ok\":false,\"action\":\"insert-row\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
-  }
-  emit("{\"ok\":true,\"action\":\"insert-row\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
-    + ",\"at_end\":" + boolJson(atEnd) + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    applied = true;
+  } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitTableStructureResult(table, contextJson, dimensions.rows + 1, dimensions.cols, applied, errors);
 }
 
 function commandDeleteRow() {
@@ -1489,13 +1513,11 @@ function commandDeleteRow() {
   var dimensions = getRegularTableDimensions(table, "delete-row");
   if (dimensions.rows <= 1) die("refusing to delete the last row; use delete-table when deleting the whole table is intended");
   if (row > dimensions.rows) die("row index out of range; table has " + dimensions.rows + " rows");
-  try { table.Rows(row).Delete(); } catch (e) { die("failed to delete row: " + e.message); }
-  var after = getRegularTableDimensions(table, "delete-row readback");
-  if (after.rows !== dimensions.rows - 1 || after.cols !== dimensions.cols) {
-    failJson("{\"ok\":false,\"action\":\"delete-row\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
-  }
-  emit("{\"ok\":true,\"action\":\"delete-row\",\"table\":" + tableIndex + ",\"deleted_row\":" + row
-    + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+  var contextJson = "\"action\":\"delete-row\",\"table\":" + tableIndex + ",\"deleted_row\":" + row
+    + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, errors = [];
+  try { table.Rows(row).Delete(); applied = true; } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitTableStructureResult(table, contextJson, dimensions.rows - 1, dimensions.cols, applied, errors);
 }
 
 function commandInsertColumn() {
@@ -1511,19 +1533,15 @@ function commandInsertColumn() {
   var dimensions = getRegularTableDimensions(table, "insert-column");
   var before = beforeText ? parsePositiveInt(beforeText, "--before") : 0;
   if (before > dimensions.cols) die("--before column is out of range; table has " + dimensions.cols + " columns");
+  var contextJson = "\"action\":\"insert-column\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
+    + ",\"at_end\":" + boolJson(atEnd) + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, errors = [];
   try {
     if (atEnd) table.Columns.Add();
     else table.Columns.Add(table.Columns(before));
-  } catch (e) {
-    die("failed to insert column: " + e.message);
-  }
-  var after = getRegularTableDimensions(table, "insert-column readback");
-  if (after.cols !== dimensions.cols + 1 || after.rows !== dimensions.rows) {
-    failJson("{\"ok\":false,\"action\":\"insert-column\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
-  }
-  emit("{\"ok\":true,\"action\":\"insert-column\",\"table\":" + tableIndex + ",\"before\":" + (before || "null")
-    + ",\"at_end\":" + boolJson(atEnd) + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols
-    + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+    applied = true;
+  } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitTableStructureResult(table, contextJson, dimensions.rows, dimensions.cols + 1, applied, errors);
 }
 
 function commandDeleteColumn() {
@@ -1537,13 +1555,11 @@ function commandDeleteColumn() {
   var dimensions = getRegularTableDimensions(table, "delete-column");
   if (dimensions.cols <= 1) die("refusing to delete the last column; use delete-table when deleting the whole table is intended");
   if (col > dimensions.cols) die("column index out of range; table has " + dimensions.cols + " columns");
-  try { table.Columns(col).Delete(); } catch (e) { die("failed to delete column: " + e.message); }
-  var after = getRegularTableDimensions(table, "delete-column readback");
-  if (after.cols !== dimensions.cols - 1 || after.rows !== dimensions.rows) {
-    failJson("{\"ok\":false,\"action\":\"delete-column\",\"error\":\"dimension readback mismatch\",\"rows\":" + after.rows + ",\"cols\":" + after.cols + "}", 3);
-  }
-  emit("{\"ok\":true,\"action\":\"delete-column\",\"table\":" + tableIndex + ",\"deleted_col\":" + col
-    + ",\"rows\":" + after.rows + ",\"cols\":" + after.cols + ",\"fingerprint\":" + q(tableFingerprint(table)) + "}");
+  var contextJson = "\"action\":\"delete-column\",\"table\":" + tableIndex + ",\"deleted_col\":" + col
+    + ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
+  var applied = null, errors = [];
+  try { table.Columns(col).Delete(); applied = true; } catch (e) { errors.push("write:" + (e.message || String(e))); }
+  emitTableStructureResult(table, contextJson, dimensions.rows, dimensions.cols - 1, applied, errors);
 }
 
 function commandSetCellShading() {

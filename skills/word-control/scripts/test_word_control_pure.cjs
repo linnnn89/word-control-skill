@@ -913,4 +913,69 @@ test('Swap and shading retain applied state and rollback evidence when final ins
   } finally { Object.assign(context, original); }
 });
 
+test('Row and column results retain completed or uncertain writes through failed dimension and fingerprint reads', () => {
+  const original = { getWord: context.getWord, tableFingerprint: context.tableFingerprint, emit: context.emit };
+  const cases = [
+    ['insert-row', 'commandInsertRow', 'rows', 1, 4, 3],
+    ['delete-row', 'commandDeleteRow', 'rows', -1, 2, 3],
+    ['insert-column', 'commandInsertColumn', 'cols', 1, 3, 4],
+    ['delete-column', 'commandDeleteColumn', 'cols', -1, 3, 2]
+  ];
+  try {
+    for (const [command, method, axis, delta, expectedRows, expectedCols] of cases) {
+      for (const mode of ['postcheck-null', 'postcheck-throw', 'success', 'row-unreadable', 'col-unreadable', 'dimension-mismatch', 'invalid-count', 'write-throw', 'write-and-postcheck']) {
+        const dimensions = { rows: 3, cols: 3 };
+        let writes = 0, inspections = 0, result;
+        function mutate() {
+          writes++;
+          if (mode !== 'dimension-mismatch') dimensions[axis] += delta;
+          if (mode === 'write-throw' || mode === 'write-and-postcheck') throw new Error('Structural write interrupted');
+        }
+        function collection(name) {
+          const items = index => { assert.equal(index, 2); return { Delete: mutate }; };
+          items.Add = mutate;
+          Object.defineProperty(items, 'Count', { get() {
+            if (writes && (mode === 'row-unreadable' && name === 'rows' || mode === 'col-unreadable' && name === 'cols')) throw new Error(name + ' unavailable');
+            return writes && mode === 'invalid-count' && name === 'rows' ? NaN : dimensions[name];
+          } });
+          return items;
+        }
+        const table = { Rows: collection('rows'), Columns: collection('cols') }, tables = () => table; tables.Count = 1;
+        const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', TrackRevisions: false, Tables: tables };
+        context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
+        context.tableFingerprint = (table, errors) => {
+          if (++inspections === 1) return 'before';
+          if (mode === 'postcheck-null') { if (errors) errors.push('Final inspection incomplete'); return null; }
+          if (mode === 'postcheck-throw' || mode === 'write-and-postcheck') throw new Error('Final inspection unavailable');
+          return 'after';
+        };
+        context.emit = text => { result = JSON.parse(text); }; context.lastError = '';
+        context.ARGS = [command, '--table', '1', '--before', '2', '--row', '2', '--col', '2',
+          '--expect-path', doc.FullName, '--expect-table-fingerprint', 'before', '--yes'];
+        if (mode === 'success') {
+          context[method]();
+          assert.equal(result.ok, true); assert.equal(result.verified, true); assert.equal(result.inspection_complete, true);
+          assert.equal(result.fingerprint, 'after'); assert.deepEqual(result.errors, []);
+          assert.equal(result.rows, expectedRows); assert.equal(result.cols, expectedCols);
+        } else {
+          assert.throws(() => context[method](), /Exit 3/);
+          assert.equal(result.ok, false); assert.equal(result.verified, false); assert.equal(result.inspection_complete, false);
+          assert.equal(result.fingerprint, null); assert.ok(result.errors.length);
+          if (mode === 'write-throw' || mode === 'write-and-postcheck') assert.ok(result.errors.some(error => error.includes('Structural write interrupted')));
+          if (mode === 'postcheck-throw' || mode === 'write-and-postcheck') assert.ok(result.errors.some(error => error.includes('Final inspection unavailable')));
+          if (mode === 'dimension-mismatch') assert.equal(result.error, 'dimension readback mismatch');
+          if (mode === 'row-unreadable' || mode === 'invalid-count') assert.equal(result.rows, null);
+          if (mode === 'col-unreadable') assert.equal(result.cols, null);
+        }
+        assert.equal(result.applied, mode === 'write-throw' || mode === 'write-and-postcheck' ? null : true);
+        assert.equal(result.document.path, doc.FullName);
+        assert.equal(result.readback.expected_rows, expectedRows); assert.equal(result.readback.expected_cols, expectedCols);
+        assert.equal(result.readback.matches_requested, ['row-unreadable', 'col-unreadable', 'invalid-count'].includes(mode) ? null : mode !== 'dimension-mismatch');
+        assert.equal(writes, 1, 'Structural writes must never be replayed or automatically reversed');
+        assert.equal(inspections, 2, 'Retain one live guard check and one final inspection');
+      }
+    }
+  } finally { Object.assign(context, original); }
+});
+
 console.log(JSON.stringify({ ok: true, pure_regression_groups: passed }));
