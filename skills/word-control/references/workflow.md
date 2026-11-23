@@ -10,7 +10,7 @@ For discovery, use `find-text` in the relevant story, bounded paragraph pages or
 
 ## Core Workflow
 
-1. Run `status` and confirm the active document name, full path, save state, read-only state, and protection state.
+1. For an edit, run `status` and confirm the active document name, full path, save state, read-only state and protection state. Pass the confirmed `--expect-path` (or `--expect-name` for an unsaved document) on subsequent inspections. For a read-only lookup with a known target, pass its identity directly to the query.
 2. Establish a verified backup before the first edit, following [Backup before editing](#backup-before-editing).
 3. Inspect the exact target immediately before mutation:
    - Text or comments: run `selection-info`, require `selection.range_edit_supported:true`, and retain `story_type`, `start`, `end`, and `text_hash`.

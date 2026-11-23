@@ -832,9 +832,11 @@ function getWord() {
   }
 }
 
-function getActiveDocument(word) {
+function getActiveDocument(word, identityRequired) {
   if (word.Documents.Count < 1) die("Word is running but no document is open");
-  return word.ActiveDocument;
+  var doc = word.ActiveDocument;
+  requireExpectedDocument(doc, identityRequired);
+  return doc;
 }
 
 function safeDocPath(doc) {
@@ -845,14 +847,19 @@ function safeDocPath(doc) {
   }
 }
 
-function requireExpectedDocument(doc) {
-  var expectedPath = opt("--expect-path", "");
-  var expectedName = opt("--expect-name", "");
-  if (!expectedPath && !expectedName && !hasFlag("--allow-active")) {
-    die("mutation requires --expect-path or --expect-name; use --allow-active only after manually verifying the active document");
+function requireExpectedDocument(doc, required) {
+  var expectedPath = opt("--expect-path", null);
+  var expectedName = opt("--expect-name", null);
+  if (expectedPath === "") die("missing value for --expect-path");
+  if (expectedName === "") die("missing value for --expect-name");
+  if (!expectedPath && !expectedName) {
+    if (required && !hasFlag("--allow-active")) die("mutation requires --expect-path or --expect-name; use --allow-active only after manually verifying the active document");
+    return;
   }
+  if (!doc) die("Word is running but no document is open");
   if (expectedPath) {
-    var actualPath = safeDocPath(doc);
+    // An unsaved document's FullName can be its bare name and resolve against the shell's directory.
+    var actualPath = doc.Path ? safeDocPath(doc) : "";
     if (!actualPath || canonicalPath(actualPath) !== canonicalPath(expectedPath)) {
       die("active document path mismatch; expected " + absPath(expectedPath) + ", got " + (actualPath || "[unsaved document]"));
     }
@@ -864,13 +871,12 @@ function requireExpectedDocument(doc) {
 }
 
 function getMutationDocument(word) {
-  var doc = getActiveDocument(word);
-  requireExpectedDocument(doc);
-  return doc;
+  return getActiveDocument(word, true);
 }
 
-function selectionSnapshot(word) {
-  var selection = word.Selection;
+function selectionSnapshot(doc) {
+  // A second application-wide lookup can follow focus into another document.
+  var selection = doc.ActiveWindow.Selection;
   var selectionType = Number(selection.Type);
   if (!isFinite(selectionType) || selectionType < 0 || selectionType !== Math.floor(selectionType)) throw new Error("cannot verify selection type");
   var range = selection.Range;
@@ -913,8 +919,8 @@ function selectionSnapshotJson(snapshot) {
     + "}";
 }
 
-function requireExpectedSelection(word, allowCollapsed) {
-  var snapshot = selectionSnapshot(word);
+function requireExpectedSelection(doc, allowCollapsed) {
+  var snapshot = selectionSnapshot(doc);
   if (!snapshot.rangeEditSupported) die("unsupported selection range (type " + snapshot.selectionType + "); select contiguous text or one complete cell; use cell-targeted table commands for multiple cells");
   if (snapshot.collapsed && !allowCollapsed && !hasFlag("--allow-insert")) {
     die("selection is collapsed; pass --allow-insert only when insertion at the cursor is intended");
@@ -939,7 +945,7 @@ function requireExpectedSelection(word, allowCollapsed) {
   return snapshot;
 }
 
-function activeDocJson(word, doc) {
+function activeDocJson(doc) {
   var path = safeDocPath(doc);
   var saved = "";
   var track = "";
@@ -999,6 +1005,7 @@ function commandHelp() {
     "  open --path file",
     "  smoke --path new-file.docx [--overwrite] --yes",
     "",
+    "Document reads (status, selection, selection-info, document-text, paragraphs, find-text, tables, equations) accept --expect-path, or --expect-name for an unsaved document.",
     "Mutation guards: use --expect-name for unsaved documents; --allow-active, --allow-unverified-selection, and --allow-unverified-target are explicit unsafe overrides.",
     "replace-paragraph is disabled; select the exact paragraph and use replace-selection."
   ].join("\n"));
@@ -1010,10 +1017,12 @@ function commandStatus() {
   var selectionLength = docs > 0 ? null : 0, selectionError = "";
   var docPart = "null";
   var selectionPart = "null";
-  if (docs > 0) docPart = activeDocJson(word, word.ActiveDocument);
-  if (docs > 0) {
+  var doc = docs > 0 ? word.ActiveDocument : null;
+  requireExpectedDocument(doc);
+  if (doc) {
+    docPart = activeDocJson(doc);
     try {
-      var snapshot = selectionSnapshot(word);
+      var snapshot = selectionSnapshot(doc);
       selectionPart = selectionSnapshotJson(snapshot);
       if (snapshot.rangeEditSupported) selectionLength = snapshot.text.length;
     } catch (e) { selectionError = e.message || String(e); }
@@ -1031,9 +1040,9 @@ function commandStatus() {
 
 function commandSelection() {
   var word = getWord();
-  getActiveDocument(word);
+  var doc = getActiveDocument(word);
   var snapshot;
-  try { snapshot = selectionSnapshot(word); } catch (e) { die("cannot read current selection: " + e.message); }
+  try { snapshot = selectionSnapshot(doc); } catch (e) { die("cannot read current selection: " + e.message); }
   if (!snapshot.rangeEditSupported) die("unsupported selection range (type " + snapshot.selectionType + "); inspect table cells or select contiguous text");
   emit(snapshot.text);
 }
@@ -1041,8 +1050,8 @@ function commandSelection() {
 function commandSelectionInfo() {
   var word = getWord();
   var doc = getActiveDocument(word);
-  var snapshot = selectionSnapshot(word);
-  emit("{\"ok\":true,\"document\":" + activeDocJson(word, doc) + ",\"selection\":" + selectionSnapshotJson(snapshot) + "}");
+  var snapshot = selectionSnapshot(doc);
+  emit("{\"ok\":true,\"document\":" + activeDocJson(doc) + ",\"selection\":" + selectionSnapshotJson(snapshot) + "}");
 }
 
 function commandConvertEquation() {
@@ -1096,7 +1105,6 @@ function commandFindText() {
   if (!isFinite(from) || from > 2147483647 || max > 100 || contextChars > 500) die("find-text limits: --from <= 2147483647, --max <= 100, --context <= 500");
   var word = getWord();
   var doc = getActiveDocument(word);
-  if (hasFlag("--expect-path") || hasFlag("--expect-name")) requireExpectedDocument(doc);
   var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
   var available = storyType === 1 || Number(storyType === 2 ? doc.Footnotes.Count : doc.Endnotes.Count) > 0;
   var matches = [], errors = [], more = false, next = null, end = 0;
@@ -1167,7 +1175,6 @@ function commandTables() {
   var first = tableText ? parsePositiveInt(tableText, "--table") : 1;
   var word = getWord();
   var doc = getActiveDocument(word);
-  if ((cellPage || compareXml) && (hasFlag("--expect-path") || hasFlag("--expect-name"))) requireExpectedDocument(doc);
   var tables = doc.Tables;
   var count = Number(tables.Count);
   if (tableText && first > count) die("table index out of range; document has " + count + " tables");
@@ -1315,7 +1322,7 @@ function commandReplaceSelection() {
   var text = readUtf8(input);
   var word = getWord();
   var doc = getMutationDocument(word);
-  var selection = requireExpectedSelection(word, false);
+  var selection = requireExpectedSelection(doc, false);
   var trackBefore = Boolean(doc.TrackRevisions);
   try {
     if (hasFlag("--track")) doc.TrackRevisions = true;
@@ -1340,7 +1347,7 @@ function commandInsertComment() {
   var text = readUtf8(input);
   var word = getWord();
   var doc = getMutationDocument(word);
-  var selection = requireExpectedSelection(word, false);
+  var selection = requireExpectedSelection(doc, false);
   try {
     doc.Comments.Add(selection.range, text);
   } catch (e) {
@@ -1372,7 +1379,7 @@ function commandCreateTable() {
   if (at === "end") {
     range = doc.Range(doc.Content.End - 1, doc.Content.End - 1);
   } else {
-    range = requireExpectedSelection(word, true).range;
+    range = requireExpectedSelection(doc, true).range;
   }
   var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
   var table = null, tableCount = null, applied = null, fillComplete = parsed ? false : null;
@@ -1843,7 +1850,7 @@ function commandInsertEquation() {
   var doc = getMutationDocument(word);
   var range;
   if (at === "end") range = doc.Range(doc.Content.End - 1, doc.Content.End - 1);
-  else range = requireExpectedSelection(word, true).range;
+  else range = requireExpectedSelection(doc, true).range;
   try {
     var equation = buildEquationInRange(doc, range, linearText);
   } catch (e) {
