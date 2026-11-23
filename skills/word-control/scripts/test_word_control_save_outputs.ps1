@@ -103,6 +103,80 @@ function Get-DocumentFootprint($Document) {
       [bool]$Document.TrackRevisions) | ConvertTo-Json -Depth 8 -Compress
 }
 
+function Test-ReadDocumentGuards($WordApplication, $ExistingDocument, [string]$OutputDirectory) {
+    $sample = $null
+    $state = { param($Document)
+        $selected = $Document.ActiveWindow.Selection
+        @((Get-DocumentFootprint $Document), [bool]$Document.Saved, $selected.Type, $selected.Range.StoryType,
+          $selected.Start, $selected.End, (Read-SharedHash $Document.FullName)) | ConvertTo-Json -Compress
+    }
+    try {
+        $sample = $WordApplication.Documents.Add()
+        $sample.Content.Text = 'ALPHA body'
+        $sample.Sections.Item(1).Headers.Item(1).Range.Text = 'Header sentinel'
+        $null = $sample.Bookmarks.Add('outside_read', $sample.Range(0,5))
+        $position = [int]$sample.Content.End - 1
+        $null = $sample.Tables.Add($sample.Range($position, $position), 1, 1)
+        $named = Invoke-Bridge @('selection-info', '--expect-name', [string]$sample.Name)
+        if (-not $named.ok -or $sample.Path) { throw 'Unsaved document name guard failed' }
+        $errorText = Invoke-Bridge @('status', '--expect-path', [string]$sample.Name) -ExpectFailure
+        if ($errorText -notmatch 'path mismatch') { throw 'An unsaved name was accepted as a file path' }
+
+        $path = Join-Path $OutputDirectory 'read-guards.docx'
+        if (Test-Path -LiteralPath $path) { throw 'Read guard fixture already exists' }
+        $sample.SaveAs2([ref][object]$path, [ref][object]16, [ref][object]$false, [ref][object]'', [ref][object]$false)
+        $sample.Range(0,5).Select()
+        $otherPath = [string]$ExistingDocument.FullName
+        $before = & $state $sample
+        $otherBefore = & $state $ExistingDocument
+        $queryFile = Join-Path $OutputDirectory 'read-query.txt'
+        $legacy = Join-Path $OutputDirectory 'read-unguarded.txt'
+        $guarded = Join-Path $OutputDirectory 'read-guarded.txt'
+        $prior = Join-Path $OutputDirectory 'read-prior-output.txt'
+        [IO.File]::WriteAllText($queryFile, 'ALPHA')
+        [IO.File]::WriteAllText($prior, 'prior output')
+        $priorHash = Read-SharedHash $prior
+        $queries = @(
+            @('status'), @('selection'), @('selection-info'), @('document-text'), @('paragraphs', '--max', '2'),
+            @('find-text', '--input', $queryFile), @('tables', '--table', '1'), @('tables', '--detail', 'summary'),
+            @('tables', '--detail', 'text'), @('tables', '--table', '1', '--detail', 'text', '--cell-from', '1'), @('equations')
+        )
+        foreach ($query in $queries) {
+            $errorText = Invoke-Bridge ($query + @('--expect-path', $otherPath, '--output', $prior, '--overwrite')) -ExpectFailure
+            if ($errorText -notmatch 'path mismatch' -or (Read-SharedHash $prior) -ne $priorHash) { throw "Wrong document read or overwritten output: $query" }
+            $null = Invoke-Bridge ($query + @('--output', $legacy, '--overwrite'))
+            $null = Invoke-Bridge ($query + @('--expect-path', $path, '--output', $guarded, '--overwrite'))
+            if ((Read-SharedHash $legacy) -ne (Read-SharedHash $guarded)) { throw "Matching identity changed query output: $query" }
+        }
+        $errorText = Invoke-Bridge @('status', '--expect-name', [string]$sample.Name) -ExpectFailure
+        if ($errorText -notmatch 'saved documents require') { throw 'Saved name-only guard did not fail as expected' }
+
+        # Switch real Word windows after document verification, before reading the selection.
+        $source = [IO.File]::ReadAllText($Bridge)
+        $hook = 'function selectionSnapshot(doc) {'
+        if ([regex]::Matches($source, [regex]::Escape($hook)).Count -ne 1) { throw 'Selection focus-switch test hook changed' }
+        $activateOther = 'doc.Application.Documents(' + (ConvertTo-Json ([string]$ExistingDocument.Name) -Compress) + ').Activate();'
+        $switchBridge = Join-Path $OutputDirectory 'read-switch-window.js'
+        [IO.File]::WriteAllText($switchBridge, $source.Replace($hook, $hook + $activateOther), [Text.Encoding]::Unicode)
+        & {
+            $Bridge = $switchBridge
+            $null = Invoke-Bridge @('selection', '--expect-path', $path, '--output', $guarded, '--overwrite')
+        }
+        if ($WordApplication.ActiveDocument.FullName -ne $otherPath -or [IO.File]::ReadAllText($guarded) -cne 'ALPHA') {
+            throw 'Guarded selection followed focus into a different document'
+        }
+        $sample.Activate()
+        if ((& $state $sample) -cne $before -or (& $state $ExistingDocument) -cne $otherBefore) {
+            throw 'Guarded inspection changed document content, objects, selection, save state or source bytes'
+        }
+        [pscustomobject]@{ok=$true; query_forms=$queries.Count; previous_output_preserved=$true; matching_output_identical=$true;
+            focus_switch_verified=$true; unsaved_name_verified=$true; both_documents_unchanged=$true}
+    } finally {
+        if ($sample) { $sample.Close([ref][object]0); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($sample) }
+        $ExistingDocument.Activate()
+    }
+}
+
 function Test-SelectionReadback($WordApplication, $ExistingDocument, [string]$OutputDirectory) {
     $sample = $null; $table = $null; $range = $null
     $cases = @('main','header','cell','collapsed')
@@ -477,13 +551,15 @@ try {
     $prefix.Text = ''
     [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($prefix)
     if ((Get-DocumentFootprint $doc) -ne $expected) { throw 'Saved/reopened document differs from expected content or structure' }
+    $readDocumentGuards = Test-ReadDocumentGuards $word $doc $Directory
     $selectionReadback = Test-SelectionReadback $word $doc $Directory
     $selectionKinds = Test-SelectionKindGuards $word $doc $Directory
     $equationModes = Test-EquationInputModes $word $doc $Directory
     $macroDisabledOpen = Test-MacroDisabledOpen $word $doc $Fixture $Directory
     [pscustomobject]@{ok=$true; word_version=$version; cancellation_events=[WordControlSaveCancellation]::Calls;
         locked_outputs_preserved=2; pdf_paths_rejected=3; source_scope_unchanged=$true; saved_readback=$true; late_close_edit_preserved=$true;
-        macro_disabled_open=$macroDisabledOpen; selection_readback=$selectionReadback; selection_kinds=$selectionKinds; equation_input_modes=$equationModes} | ConvertTo-Json -Depth 5
+        macro_disabled_open=$macroDisabledOpen; read_document_guards=$readDocumentGuards; selection_readback=$selectionReadback;
+        selection_kinds=$selectionKinds; equation_input_modes=$equationModes} | ConvertTo-Json -Depth 5
 }
 finally {
     if ($attached) { [void][Runtime.InteropServices.ComEventsHelper]::Remove($word, [WordControlSaveCancellation]::Events, 8, [WordControlSaveCancellation]::Handler) }

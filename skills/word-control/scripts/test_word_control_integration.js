@@ -52,6 +52,12 @@ function writeUtf8(path, text) {
   stream.Close();
 }
 
+function writeTestScript(path, source) {
+  // WSH recognizes UTF-16 scripts. ADODB's UTF-8 BOM can cause a compile error on line one.
+  var stream = fso.CreateTextFile(path, true, true);
+  try { stream.Write(source); } finally { stream.Close(); }
+}
+
 function parseJsonFile(path) {
   return eval("(" + readUtf8(path) + ")");
 }
@@ -227,7 +233,7 @@ function exerciseVerifiedCellResults() {
     var source = readUtf8(bridge), needle = "function tableFingerprint(table, readErrors) {";
     assertTrue(source.indexOf(needle) >= 0, "Final-inspection injection point missing");
     var faultBridge = fso.BuildPath(testDir, "cell-final-inspection-failure.js");
-    writeUtf8(faultBridge, source.replace(needle, "var injectedPostChecks = 0;\n" + needle
+    writeTestScript(faultBridge, source.replace(needle, "var injectedPostChecks = 0;\n" + needle
       + "\n  if (++injectedPostChecks === 2) { if (readErrors) readErrors.push('injected incomplete final inspection'); return null; }"));
     var initial = runJson(["tables", "--table", "1"], "cell-result-initial.json").tables[0];
     var fingerprint = initial.fingerprint;
@@ -295,7 +301,7 @@ function exerciseStructureResults() {
     var source = readUtf8(bridge), needle = "function tableFingerprint(table, readErrors) {";
     assertTrue(source.indexOf(needle) >= 0, "Structural final-inspection injection point missing");
     var faultBridge = fso.BuildPath(testDir, "structure-final-inspection-failure.js");
-    writeUtf8(faultBridge, source.replace(needle, "var injectedPostChecks = 0;\n" + needle
+    writeTestScript(faultBridge, source.replace(needle, "var injectedPostChecks = 0;\n" + needle
       + "\n  if (++injectedPostChecks === 2) { if (readErrors) readErrors.push('injected incomplete structural inspection'); return null; }"));
     var cases = [["insert-row", true, false], ["delete-row", true, true], ["insert-column", false, false], ["delete-column", false, true]];
     for (var i = 0; i < cases.length; i++) {
@@ -377,7 +383,7 @@ function exerciseDeletionResults() {
   var source = readUtf8(bridge), needle = "var afterCount = Number(doc[collectionName].Count);";
   assertTrue(source.indexOf(needle) >= 0, "Deletion readback injection point missing");
   var faultBridge = fso.BuildPath(testDir, "deletion-readback-failure.js");
-  writeUtf8(faultBridge, source.replace(needle, "throw new Error('injected deletion count read failure');\n    " + needle));
+  writeTestScript(faultBridge, source.replace(needle, "throw new Error('injected deletion count read failure');\n    " + needle));
   for (var kind = 0; kind < 2; kind++) for (var mode = 0; mode < 4; mode++) {
     if (kind === 1 && mode === 2) continue;
     var collectionName = kind === 0 ? "Tables" : "OMaths", command = kind === 0 ? "delete-table" : "delete-equation";
@@ -1022,7 +1028,13 @@ try {
   word.DisplayAlerts = 0;
   doc = word.Documents.Add();
   doc.Content.Text = "seed text\rsoft\x0bline\rpage\fbreak\r";
+  var seedText = String(doc.Content.Text);
   try { doc.SaveAs2(docPath); } catch (saveError) { doc.SaveAs(docPath); }
+  // The same page-break fixture can stall in Tables.Add while it is still a newly created Word document.
+  doc.Close(false);
+  doc = word.Documents.Open(docPath, false, false, false);
+  doc.Activate();
+  assertTrue(String(doc.Content.Text) === seedText, "Reopening the synthetic fixture changed its control characters");
   exerciseXmlMutationDetection();
   exerciseCellTextFidelity();
   exerciseVerifiedCellResults();

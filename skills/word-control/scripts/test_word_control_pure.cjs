@@ -163,14 +163,16 @@ test('Equation construction confirms UnicodeMath before writing and restores the
 });
 
 const range = { Start: 0, End: 4, Text: 'same', StoryType: 1 };
-const selection = context.selectionSnapshot({ Selection: { Range: range, Type: 2 } });
+const selectionDoc = { ActiveWindow: { Selection: { Range: range, Type: 2 } } };
+const selection = context.selectionSnapshot(selectionDoc);
 const guards = ['--expect-story-type', '1', '--expect-start', '0', '--expect-end', '4', '--expect-selection-hash', selection.hash];
 test('Identical text and coordinates in a different story are rejected', () => {
   context.ARGS = ['replace-selection', ...guards];
-  assert.throws(() => context.requireExpectedSelection({ Selection: { Range: { ...range, StoryType: 7 }, Type: 2 } }, false), /story changed/);
-  assert.equal(context.requireExpectedSelection({ Selection: { Range: range, Type: 2 } }, false).hash, selection.hash);
+  const headerDoc = { ActiveWindow: { Selection: { Range: { ...range, StoryType: 7 }, Type: 2 } } };
+  assert.throws(() => context.requireExpectedSelection(headerDoc, false), /story changed/);
+  assert.equal(context.requireExpectedSelection(selectionDoc, false).hash, selection.hash);
   context.ARGS = ['replace-selection', ...guards.slice(2)];
-  assert.throws(() => context.requireExpectedSelection({ Selection: { Range: range, Type: 2 } }, false), /expect-story-type/);
+  assert.throws(() => context.requireExpectedSelection(selectionDoc, false), /expect-story-type/);
 });
 
 test('Selection text and status do not expose the next character at an insertion point', () => {
@@ -182,8 +184,9 @@ test('Selection text and status do not expose the next character at an insertion
       const range = { Text: text, Start: 0, End: text.length, StoryType: 1 };
       const selection = { Range: range, Type: collapsed ? 1 : 2, Start: range.Start, End: range.End,
         get Text() { textReads++; return collapsed ? 'A' : text; } };
-      const doc = { Name: 'source.docx', FullName: 'C:\\test\\source.docx', Saved: true, TrackRevisions: false, ReadOnly: false, ProtectionType: -1 };
-      context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc, Version: '16.0', Selection: selection });
+      const doc = { Name: 'source.docx', FullName: 'C:\\test\\source.docx', Saved: true, TrackRevisions: false, ReadOnly: false, ProtectionType: -1,
+        ActiveWindow: { Selection: selection } };
+      context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc, Version: '16.0' });
       context.emit = value => { result = value; };
       context.commandSelection();
       assert.equal(result, collapsed ? '' : 'Alpha\n', 'An insertion point must not be reported as selected text');
@@ -203,11 +206,79 @@ test('A saved document cannot be verified by filename alone', () => {
   context.requireExpectedDocument({ Name: 'report.docx', Path: '' });
 });
 
+test('Every document read checks an explicit identity before accessing content or emitting output', () => {
+  const original = { getWord: context.getWord, readUtf8: context.readUtf8, emit: context.emit, ARGS: context.ARGS };
+  try {
+    const doc = { Name: 'other.docx', FullName: 'C:\\test\\other.docx', Path: 'C:\\test' };
+    const word = { Documents: { Count: 1 }, ActiveDocument: doc, Version: '16.0' };
+    for (const key of ['Content', 'Paragraphs', 'Tables', 'OMaths', 'ActiveWindow', 'Saved']) {
+      Object.defineProperty(doc, key, { get() { assert.fail('Read ' + key + ' before verifying the document'); } });
+    }
+    context.getWord = () => word;
+    context.readUtf8 = () => 'query';
+    context.emit = () => assert.fail('Unexpected output');
+    for (const [command, run] of [
+      ['status', context.commandStatus], ['selection', context.commandSelection], ['selection-info', context.commandSelectionInfo],
+      ['document-text', context.commandDocumentText], ['paragraphs', context.commandParagraphs], ['find-text', context.commandFindText],
+      ['tables', context.commandTables], ['equations', context.commandEquations],
+    ]) {
+      context.ARGS = [command, '--expect-path', 'C:\\test\\intended.docx', '--allow-active'];
+      assert.throws(run, /active document path mismatch/, command);
+    }
+    context.ARGS = ['status', '--expect-path', '', '--allow-active'];
+    assert.throws(context.commandStatus, /missing value for --expect-path/);
+    context.ARGS = ['status', '--expect-name'];
+    assert.throws(context.commandStatus, /missing value for --expect-name/);
+    word.Documents.Count = 0;
+    context.ARGS = ['status', '--expect-path', doc.FullName];
+    assert.throws(context.commandStatus, /no document is open/);
+    context.ARGS = ['status'];
+    let result;
+    context.emit = value => { result = JSON.parse(value); };
+    context.commandStatus();
+    assert.equal(result.active_document, null);
+  } finally { Object.assign(context, original); }
+});
+
+test('Selection reads and writes keep the window of the inspected document across a focus change', () => {
+  const original = { getWord: context.getWord, readUtf8: context.readUtf8, emit: context.emit, ARGS: context.ARGS };
+  try {
+    const first = { Start: 0, End: 4, StoryType: 1, Text: 'same' };
+    const second = { ...first };
+    const doc = { Name: 'first.docx', Path: 'C:\\test', FullName: 'C:\\test\\first.docx', TrackRevisions: false,
+      ActiveWindow: { Selection: { Type: 2, Range: first } } };
+    const other = { Name: 'second.docx', Path: 'C:\\test', FullName: 'C:\\test\\second.docx',
+      ActiveWindow: { Selection: { Type: 2, Range: second } } };
+    let activeReads = 0;
+    context.getWord = () => ({ Documents: { Count: 2 }, get ActiveDocument() { return ++activeReads === 1 ? doc : other; },
+      get Selection() { return other.ActiveWindow.Selection; } });
+    let value;
+    context.emit = result => { value = result; };
+    context.ARGS = ['selection-info', '--expect-path', doc.FullName];
+    context.commandSelectionInfo();
+    const snapshot = JSON.parse(value).selection;
+    assert.equal(activeReads, 1);
+    activeReads = 0;
+    context.ARGS = ['replace-selection', '--expect-path', doc.FullName, '--expect-story-type', '1', '--expect-start', '0',
+      '--expect-end', '4', '--expect-selection-hash', snapshot.text_hash, '--yes'];
+    context.readUtf8 = () => 'edit';
+    context.commandReplaceSelection();
+    assert.equal(activeReads, 1);
+    assert.equal(first.Text, 'edit');
+    assert.equal(second.Text, 'same');
+    activeReads = 0;
+    context.ARGS = ['selection', '--expect-path', doc.FullName];
+    context.commandSelection();
+    assert.equal(value, 'edit');
+  } finally { Object.assign(context, original); }
+});
+
 test('Failed tracked replacement restores previous tracking state', () => {
-  const doc = { Name: 'test.docx', FullName: 'C:\\test\\test.docx', TrackRevisions: false };
+  const doc = { Name: 'test.docx', Path: 'C:\\test', FullName: 'C:\\test\\test.docx', TrackRevisions: false };
   const target = { ...range };
   Object.defineProperty(target, 'Text', { get() { return 'same'; }, set() { throw new Error('Protected range'); } });
-  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc, Selection: { Range: target, Type: 2 } });
+  doc.ActiveWindow = { Selection: { Range: target, Type: 2 } };
+  context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
   context.readUtf8 = () => 'changed';
   context.ARGS = ['replace-selection', '--yes', '--track', '--expect-path', doc.FullName, ...guards];
   assert.throws(() => context.commandReplaceSelection(), /Protected range/);
@@ -231,13 +302,15 @@ test('Selection mutations refuse ambiguous kinds before writing and invalidate g
         const cells = () => ({ Range: cellRange }); cells.Count = count;
         const target = { Start: 0, End: 20, StoryType: 1, Cells: cells,
           get Text() { return 'cell\r\x07cell\r\x07'; }, set Text(value) { writes++; } };
-        const doc = { Name: 'source.docx', FullName: 'C:\\test\\source.docx', TrackRevisions: false,
+        const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', TrackRevisions: false,
+          ActiveWindow: { Selection: { Range: target, Type: type } },
           Comments: { Add() { writes++; } }, Tables: { Add() { writes++; } } };
-        const word = { Documents: { Count: 1 }, ActiveDocument: doc, Selection: { Range: target, Type: type } };
+        const word = { Documents: { Count: 1 }, ActiveDocument: doc };
         let output;
         context.getWord = () => word; context.readUtf8 = () => 'replacement'; context.emit = value => { output = value; };
         context.buildEquationInRange = () => { writes++; };
-        const snapshot = context.selectionSnapshot(word);
+        const snapshot = context.selectionSnapshot(doc);
+        context.ARGS = ['selection'];
         assert.throws(() => context.commandSelection(), /unsupported selection range/, 'A raw selection read must not silently return part of a special selection');
         context.commandStatus();
         const status = JSON.parse(output);
@@ -255,24 +328,24 @@ test('Selection mutations refuse ambiguous kinds before writing and invalidate g
     const cellRange = { Start: 0, End: 5 };
     const cells = () => ({ Range: cellRange }); cells.Count = 1;
     const target = { ...cellRange, StoryType: 1, Text: 'cell\r\x07', Cells: cells };
-    const word = { Selection: { Range: target, Type: 4 } };
-    const snapshot = context.selectionSnapshot(word);
+    const doc = { ActiveWindow: { Selection: { Range: target, Type: 4 } } };
+    const snapshot = context.selectionSnapshot(doc);
     context.ARGS = ['replace-selection', ...args(snapshot)];
-    assert.equal(context.requireExpectedSelection(word, false).rangeEditSupported, true, 'A complete single cell remains supported');
-    word.Selection.Type = 2;
-    assert.equal(context.selectionSnapshot(word).rangeEditSupported, true);
-    assert.throws(() => context.requireExpectedSelection(word, false), /selection text or type changed/);
-    word.Selection.Type = NaN;
-    assert.throws(() => context.selectionSnapshot(word), /selection type/);
-    word.Selection.Type = 4; cells.Count = NaN;
-    assert.throws(() => context.selectionSnapshot(word), /selection cell count/);
+    assert.equal(context.requireExpectedSelection(doc, false).rangeEditSupported, true, 'A complete single cell remains supported');
+    doc.ActiveWindow.Selection.Type = 2;
+    assert.equal(context.selectionSnapshot(doc).rangeEditSupported, true);
+    assert.throws(() => context.requireExpectedSelection(doc, false), /selection text or type changed/);
+    doc.ActiveWindow.Selection.Type = NaN;
+    assert.throws(() => context.selectionSnapshot(doc), /selection type/);
+    doc.ActiveWindow.Selection.Type = 4; cells.Count = NaN;
+    assert.throws(() => context.selectionSnapshot(doc), /selection cell count/);
     let output;
     context.getWord = () => ({ Documents: { Count: 0 }, Version: '16.0', get Selection() { throw new Error('No selection without a document'); } });
     context.emit = value => { output = JSON.parse(value); };
     context.commandStatus();
     assert.equal(output.selection_text_length, 0); assert.equal(output.selection, null);
-    context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: { Name: 'source.docx' }, Version: '16.0',
-      Selection: { get Type() { throw new Error('Selection interface unreadable'); } } });
+    context.getWord = () => ({ Documents: { Count: 1 }, Version: '16.0', ActiveDocument: { Name: 'source.docx',
+      ActiveWindow: { Selection: { get Type() { throw new Error('Selection interface unreadable'); } } } } });
     context.commandStatus();
     assert.equal(output.selection_text_length, null); assert.equal(output.selection, null);
     assert.match(output.selection_read_error, /Selection interface unreadable/);
@@ -692,7 +765,7 @@ test('Literal search keeps story offsets and restores Find settings on success a
     for (const key of Object.keys(settings)) Object.defineProperty(finder, key, { get: () => settings[key], set: v => { settings[key] = v; } });
     value.Find = finder; return value;
   }
-  const doc = { Name: 'query.docx', FullName: 'C:\\test\\query.docx', Content: range('A needle B needle C ^p\r'),
+  const doc = { Name: 'query.docx', Path: 'C:\\test', FullName: 'C:\\test\\query.docx', Content: range('A needle B needle C ^p\r'),
     Footnotes: { Count: 0 }, Endnotes: { Count: 1 }, StoryRanges: () => range('note needle\r') };
   context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
   context.emit = output => { result = JSON.parse(output); };

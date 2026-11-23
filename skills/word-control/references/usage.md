@@ -28,6 +28,8 @@ Read-only commands are `help`, `status`, `selection`, `selection-info`, `documen
 
 Use the active document path returned by `status` as `<doc>`. For an unsaved document, use its exact name with `--expect-name` instead.
 
+If you already know the target, pass its identity directly to `status`, `selection`, `selection-info`, `document-text`, `paragraphs`, `find-text`, `tables` or `equations`. For example, `cscript //nologo $wc paragraphs --from 81 --max 5 --expect-path "<doc>" --output page.json` checks the path and reads the page in one invocation. A mismatch exits before reading document content or replacing an existing output. Omit both identity options to inspect whichever document is active. Selection reads and edits use the window of the document captured by that command.
+
 To open a document, use `open --path "<doc>"`. The command temporarily sets Word's [AutomationSecurity](https://learn.microsoft.com/en-us/office/vba/api/word.application.automationsecurity) to force-disable document macros, verifies that setting before opening, and then restores the original value. Failure to establish the guard prevents the open call. This controls programmatic document macros, not every Office parser, add-in or external-content behavior.
 
 The open result retains `action` and `path`, and adds `opened`, `automation_security_restored` and `errors`. `opened:true` means Word returned an opened document; false means opening was not attempted, and null means the call threw with uncertain effects. Any preparation, open or restoration error returns a nonzero exit. Inspect the current documents and security state before retrying; a restoration failure can leave the requested document open. Failed opens only clean up an empty Word instance created by that command, never an existing user instance or an instance with documents.
@@ -48,7 +50,7 @@ The open result retains `action` and `path`, and adds `opened`, `automation_secu
 
 Choose `--story main` (default), `footnotes`, or `endnotes`; only that story is searched. Headers, footers, text boxes and other stories are not covered. An absent note story returns `story_available:false` with no matches. Output includes document identity, `story_type`, match `start`/`end`, bounded context, `has_more`, and `next_from`. Positions are Word character positions within that story, not indices into normalized JSON text. `--from` defaults to 0; `--max` defaults to 20 and is capped at 100; `--context` defaults to 80 characters on each side and is capped at 500. A full page checks one extra match to determine `has_more`; follow `next_from` only while the document is unchanged. `inspection_complete:true` means the requested query completed, not that every story or every page of matches was returned.
 
-Search/read/Find-restoration failures return nonzero exit with `ok:false`, partial `matches`, `read_errors`, and unknown `has_more`. Search results are discovery evidence, not mutation guards. `find-text` and paged table queries optionally accept `--expect-path` or `--expect-name` to reject the wrong active document.
+Search/read/Find-restoration failures return nonzero exit with `ok:false`, partial `matches`, `read_errors`, and unknown `has_more`. Use search results for discovery and inspect the target before editing.
 
 Without the new options, successful paragraph/table limits, full-detail fields and output shapes are unchanged. Failed paragraph reads return `text:null`, with top-level `inspection_complete:false` and indexed `read_errors`; they are not empty paragraphs. Failed equation reads return `text:null`, `fingerprint:null`, `inspection_complete:false` and `read_errors` on that equation. Successful equation text and its fingerprint come from one read. Do not treat a partial response as complete document evidence; resolve the error and re-read the affected scope.
 
@@ -92,6 +94,8 @@ Selection changes invalidate the snapshot. Inspect again before a second change.
 Comments and tracked changes can be created or toggled, but a full review-history report is not supported.
 
 ## Tables
+
+If `create-table` stalls on a newly created document, wait for Word to respond and inspect its tables before retrying. For diagnosis, reproduce the operation on a saved copy reopened in Word. Preserve any unsaved work in the user's document. The [maintenance notes](maintenance.md) record the affected Word build and fixture.
 
 Use the target fingerprint from a fresh full `tables --table N` result:
 

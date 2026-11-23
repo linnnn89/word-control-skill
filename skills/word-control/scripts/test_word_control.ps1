@@ -244,7 +244,7 @@ try {
         }
         $saveOutputGuards = ($guardOutput -join [Environment]::NewLine) | ConvertFrom-Json
         if (-not $saveOutputGuards.ok -or -not $saveOutputGuards.saved_readback -or -not $saveOutputGuards.late_close_edit_preserved -or
-            -not $saveOutputGuards.macro_disabled_open.ok -or -not $saveOutputGuards.selection_readback.ok -or
+            -not $saveOutputGuards.macro_disabled_open.ok -or -not $saveOutputGuards.read_document_guards.ok -or -not $saveOutputGuards.selection_readback.ok -or
             -not $saveOutputGuards.selection_kinds.ok -or -not $saveOutputGuards.equation_input_modes.ok) { throw 'Save/output/open/selection/equation regression did not verify success' }
         $saveOutputGuards | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runDir 'save-output-guards.json') -Encoding UTF8
     }
