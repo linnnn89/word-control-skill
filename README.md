@@ -112,6 +112,8 @@ Write-Output "Previous installation preserved at: $backup"
 
 ## 入口与操作手册
 
+升级已有调用脚本时，先重新读取选区。用 `set-cell` 写表格前，要用同一行列或线性编号检查目标单元格，并同时传入表格指纹和单元格指纹。操作手册给出了按行标识、列标题和原值核对的[命令示例](skills/word-control/references/usage.md#tables)。
+
 安装后从简短的 [SKILL.md](skills/word-control/SKILL.md) 进入，按任务加载所需手册。README 负责安装和上手，具体命令与编辑规则以手册为准。
 
 | 任务 | 读取位置 |

@@ -36,6 +36,8 @@ The open result retains `action` and `path`, and adds `opened`, `automation_secu
 
 ### Scoped queries
 
+For `set-cell`, request the target with `tables --table N --row R --col C` or `tables --table N --cell K`. Full detail includes the cell's address, exact current text and `target.fingerprint` alongside the table fingerprint. Identify the record using its labels and values before retaining these two guards. After insertion, deletion or reordering, locate the record again using its labels.
+
 - `paragraphs --from N --max count` reads only the requested entries of Word's document paragraph collection. Indices are 1-based and remain absolute in the result. `--max` defaults to 80. With `--from`, the result adds `from` and `next_from`; `next_from:null` means the end. Starting beyond the end returns an empty page. These are live indices, not stable cursors across edits; refresh after document changes.
 - `tables --table N` reads only that table, in full detail by default. `table_count` remains the whole collection count and `returned` is 1. An out-of-range index fails. Do not combine `--table` and `--max`; existing `tables --max N` still reads the first N tables.
 - `tables --detail summary` reads table dimensions and cell counts without retrieving cell text, formatting or fingerprints. It works with `--table` or `--max`. Every summary uses `fingerprint:null`, `inspection_complete:false`, `layout:"unverified"`, and empty cell arrays. Unknown dimensions/counts remain null with warnings/read errors. Counts alone do not prove that a table is rectangular.
@@ -85,7 +87,9 @@ cscript //nologo $wc replace-selection --input revised.txt --track --expect-path
 cscript //nologo $wc insert-comment --input comment.txt --expect-path "<doc>" --expect-story-type <story_type> --expect-start <start> --expect-end <end> --expect-selection-hash <hash> --yes
 ```
 
-Snapshots include Word's `selection_type` and `range_edit_supported`. The opaque `text_hash` includes the selection type as well as text; refresh snapshots after upgrading or changing the selection. The same four guard arguments remain required. A successful `--track` edit keeps Track Changes on; a failed edit attempts to restore its previous state and reports restoration failures.
+Snapshots include Word's `selection_type` and `range_edit_supported`. The opaque `text_hash` binds the selected text and type to the first and last paragraphs it touches. Inside a table it also covers the table text. In a header or footer it includes the owning section. Refresh snapshots after upgrading or changing the context. The four guard arguments are unchanged. A successful `--track` edit keeps Track Changes on. A failed edit attempts to restore its previous state and reports restoration failures.
+
+When the selected text ends in a paragraph mark, `replace-selection` edits the text up to that mark and reports `paragraph_mark_preserved:true`. One trailing line ending in the input represents the retained mark. Internal paragraph breaks are part of the selected content. To explicitly join the following paragraph, include the mark in the selection, pass `--replace-paragraph-mark` and omit the final line ending from the input.
 
 Selection-based writes support ordinary contiguous text, insertion points and exactly one complete table cell. Multiple-cell spans, whole rows/columns across cells, rectangular blocks, frames, shapes and unknown selection types are refused before writing, even with `--allow-unverified-selection`. Use scoped table queries and cell-targeted commands for multiple cells. This boundary applies to `replace-selection`, `insert-comment`, and `create-table`/`insert-equation` with `--at selection`; `--at end` does not use the current selection.
 
@@ -102,9 +106,11 @@ Use the target fingerprint from a fresh full `tables --table N` result:
 ```powershell
 cscript //nologo $wc create-table --rows 3 --cols 3 --input table.tsv --at end --expect-path "<doc>" --yes
 
-cscript //nologo $wc set-cell --table 1 --expect-table-fingerprint <hash> --row 2 --col 2 --input cell.txt --expect-path "<doc>" --yes
+cscript //nologo $wc tables --table 1 --row 2 --col 2 --expect-path "<doc>"
+cscript //nologo $wc set-cell --table 1 --row 2 --col 2 --expect-table-fingerprint <table_hash> --expect-cell-fingerprint <cell_hash> --expect-row-label "B" --expect-column-label "STATUS" --expect-cell-text "PENDING" --input cell.txt --expect-path "<doc>" --yes
 
-cscript //nologo $wc set-cell --table 1 --expect-table-fingerprint <hash> --cell 4 --input cell.txt --expect-path "<doc>" --yes
+cscript //nologo $wc tables --table 1 --cell 4 --expect-path "<doc>"
+cscript //nologo $wc set-cell --table 1 --cell 4 --expect-table-fingerprint <table_hash> --expect-cell-fingerprint <cell_hash> --input cell.txt --expect-path "<doc>" --yes
 
 cscript //nologo $wc swap-cell-text --table 1 --expect-table-fingerprint <hash> --from-row 1 --from-col 1 --to-row 1 --to-col 3 --expect-path "<doc>" --yes
 
@@ -130,7 +136,9 @@ For `create-table --at selection`, also provide the fresh selection guards. TSV 
 
 Table fingerprints include raw Word text, including paragraph and cell-boundary characters, plus the existing guarded formatting. Refresh full table inspections after updating this version; fingerprints from the previous text normalization are stale. Display output and selection/equation hashes retain their existing normalization.
 
-`set-cell` additionally returns `document`, `applied`, `verified`, `inspection_complete`, `readback`, and `errors`. A verified success compares the actual cell content with the requested text (normalizing CRLF/CR/LF and excluding only Word's terminal cell marker), then returns the existing full post-write fingerprint. `readback` includes `matches_requested`, actual character count and text hash without echoing the whole cell. For a subsequent operation on this verified target, the returned fingerprint can replace a redundant full query: the next mutation still recomputes and compares the live full fingerprint. Requery when a different scope or visual inspection is needed.
+Every guarded `set-cell` now requires `--expect-cell-fingerprint` from an inspection using the same addressing mode. Its inputs are the table index, cell address, original cell text, and all table text on either side, including record labels and column headings. For a labelled table, `--expect-row-label` checks column 1 of the target row and `--expect-column-label` checks row 1 of the target column. `--expect-cell-text` checks the old value. These checks are case-sensitive, preserve whitespace and normalize line endings. An ambiguous label needs independent identification before choosing a cell.
+
+The write reads the addressed cell again and compares all table text on both sides with the pre-write values. Require `verified:true`, `readback.matches_requested:true` and `readback.surrounding_text_unchanged:true`. A verified result returns `fingerprint` and `cell_fingerprint` for another edit to this same cell. Obtain a separate target inspection for a different cell. After an unverified write both fingerprints are null.
 
 If a write completes but readback or formatting inspection fails, `set-cell` returns `applied:true`, `verified:false`, `fingerprint:null` and a nonzero exit. If the write itself throws, `applied:null` means its effect is unknown. Inspect the current document before retrying; neither case promises rollback or permits automatic replay.
 

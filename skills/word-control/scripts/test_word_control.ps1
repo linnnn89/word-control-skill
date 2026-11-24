@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$TempRoot = (Join-Path (Get-Location) '_tmp_test_outputs'),
-    [string]$FixturePath = ''
+    [string]$FixturePath = '',
+    [switch]$KeepArtifacts
 )
 
 $ErrorActionPreference = 'Stop'
@@ -226,7 +227,7 @@ try {
             throw "isolated integration test left Word process(es): $($newWordPids -join ', ')`n$integrationText"
         }
         $integration = $integrationText | ConvertFrom-Json
-        if (-not $integration.ok -or -not $integration.advanced_tables -or -not $integration.scoped_inspection -or -not $integration.cell_text_fidelity -or
+        if (-not $integration.ok -or -not $integration.row_target_guards -or -not $integration.advanced_tables -or -not $integration.scoped_inspection -or -not $integration.cell_text_fidelity -or
             -not $integration.verified_cell_results -or -not $integration.verified_structure_results -or -not $integration.verified_deletion_results) {
             throw 'isolated command integration returned an unsuccessful result'
         }
@@ -325,6 +326,7 @@ try {
         smoke_output_guards = $smokeOutputGuards
         overwrite_guard = 'passed'
         guarded_command_integration = $commandIntegration
+        row_target_guards = $commandIntegration
         advanced_table_operations = $commandIntegration
         scoped_inspection = $commandIntegration
         cell_text_fidelity = $commandIntegration
@@ -336,10 +338,10 @@ try {
     } | ConvertTo-Json -Compress -Depth 5
 }
 finally {
-    if (Test-Path -LiteralPath $runDir) {
+    if (-not $KeepArtifacts -and (Test-Path -LiteralPath $runDir)) {
         Remove-Item -LiteralPath $runDir -Recurse -Force
     }
-    if ($createdRoot -and (Test-Path -LiteralPath $TempRoot)) {
+    if (-not $KeepArtifacts -and $createdRoot -and (Test-Path -LiteralPath $TempRoot)) {
         $remaining = @(Get-ChildItem -LiteralPath $TempRoot -Force)
         if ($remaining.Count -eq 0) {
             Remove-Item -LiteralPath $TempRoot

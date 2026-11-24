@@ -162,13 +162,17 @@ test('Equation construction confirms UnicodeMath before writing and restores the
   } finally { context.buildEquationContent = originalBuild; }
 });
 
-const range = { Start: 0, End: 4, Text: 'same', StoryType: 1 };
+function singleParagraph(text) {
+  const paragraph = { Range: { Start: 0, Text: text } };
+  return { First: paragraph, Last: paragraph };
+}
+const range = { Start: 0, End: 4, Text: 'same', StoryType: 1, Paragraphs: singleParagraph('same\r'), Tables: { Count: 0 } };
 const selectionDoc = { ActiveWindow: { Selection: { Range: range, Type: 2 } } };
 const selection = context.selectionSnapshot(selectionDoc);
 const guards = ['--expect-story-type', '1', '--expect-start', '0', '--expect-end', '4', '--expect-selection-hash', selection.hash];
 test('Identical text and coordinates in a different story are rejected', () => {
   context.ARGS = ['replace-selection', ...guards];
-  const headerDoc = { ActiveWindow: { Selection: { Range: { ...range, StoryType: 7 }, Type: 2 } } };
+  const headerDoc = { ActiveWindow: { Selection: { Range: { ...range, StoryType: 7, Sections: { First: { Index: 1 } } }, Type: 2 } } };
   assert.throws(() => context.requireExpectedSelection(headerDoc, false), /story changed/);
   assert.equal(context.requireExpectedSelection(selectionDoc, false).hash, selection.hash);
   context.ARGS = ['replace-selection', ...guards.slice(2)];
@@ -181,7 +185,7 @@ test('Selection text and status do not expose the next character at an insertion
     for (const collapsed of [true, false]) {
       let textReads = 0, result;
       const text = collapsed ? '' : 'Alpha\r';
-      const range = { Text: text, Start: 0, End: text.length, StoryType: 1 };
+      const range = { Text: text, Start: 0, End: text.length, StoryType: 1, Paragraphs: singleParagraph('Alpha\r'), Tables: { Count: 0 } };
       const selection = { Range: range, Type: collapsed ? 1 : 2, Start: range.Start, End: range.End,
         get Text() { textReads++; return collapsed ? 'A' : text; } };
       const doc = { Name: 'source.docx', FullName: 'C:\\test\\source.docx', Saved: true, TrackRevisions: false, ReadOnly: false, ProtectionType: -1,
@@ -243,7 +247,7 @@ test('Every document read checks an explicit identity before accessing content o
 test('Selection reads and writes keep the window of the inspected document across a focus change', () => {
   const original = { getWord: context.getWord, readUtf8: context.readUtf8, emit: context.emit, ARGS: context.ARGS };
   try {
-    const first = { Start: 0, End: 4, StoryType: 1, Text: 'same' };
+    const first = { ...range };
     const second = { ...first };
     const doc = { Name: 'first.docx', Path: 'C:\\test', FullName: 'C:\\test\\first.docx', TrackRevisions: false,
       ActiveWindow: { Selection: { Type: 2, Range: first } } };
@@ -327,14 +331,15 @@ test('Selection mutations refuse ambiguous kinds before writing and invalidate g
     }
     const cellRange = { Start: 0, End: 5 };
     const cells = () => ({ Range: cellRange }); cells.Count = 1;
-    const target = { ...cellRange, StoryType: 1, Text: 'cell\r\x07', Cells: cells };
+    const tables = () => ({ Range: { Text: 'ID\r\x07cell\r\x07' } }); tables.Count = 1;
+    const target = { ...cellRange, StoryType: 1, Text: 'cell\r\x07', Cells: cells, Paragraphs: singleParagraph('cell\r\x07'), Tables: tables };
     const doc = { ActiveWindow: { Selection: { Range: target, Type: 4 } } };
     const snapshot = context.selectionSnapshot(doc);
     context.ARGS = ['replace-selection', ...args(snapshot)];
     assert.equal(context.requireExpectedSelection(doc, false).rangeEditSupported, true, 'A complete single cell remains supported');
     doc.ActiveWindow.Selection.Type = 2;
     assert.equal(context.selectionSnapshot(doc).rangeEditSupported, true);
-    assert.throws(() => context.requireExpectedSelection(doc, false), /selection text or type changed/);
+    assert.throws(() => context.requireExpectedSelection(doc, false), /paragraph context changed/);
     doc.ActiveWindow.Selection.Type = NaN;
     assert.throws(() => context.selectionSnapshot(doc), /selection type/);
     doc.ActiveWindow.Selection.Type = 4; cells.Count = NaN;
@@ -697,7 +702,7 @@ test('Single-table inspection is bounded and read-only detail cannot supply muta
 });
 
 test('Set-cell reports verified readback or an explicit unverified write without a reusable guard', () => {
-  const original = { readUtf8: context.readUtf8, tableFingerprint: context.tableFingerprint };
+  const original = { readUtf8: context.readUtf8, tableFingerprint: context.tableFingerprint, cellTextScope: context.cellTextScope };
   let result, value, mode, fingerprints;
   const range = { End: 10, get Text() { return value + '\r\x07'; }, set Text(input) {
     value = mode === 'mismatch' ? 'unexpected' : input.replace(/\r\n|\n/g, '\r');
@@ -708,6 +713,8 @@ test('Set-cell reports verified readback or an explicit unverified write without
   const doc = { Name: 'source.docx', Path: 'C:\\test', FullName: 'C:\\test\\source.docx', Tables: tables };
   context.getWord = () => ({ Documents: { Count: 1 }, ActiveDocument: doc });
   context.readUtf8 = () => '中文\r\nsecond\n';
+  context.cellTextScope = () => ({ before: 'ID', value,
+    after: mode === 'neighbor-mismatch' && value !== 'old' ? 'changed neighbor' : 'neighbor' });
   context.tableFingerprint = () => {
     fingerprints++;
     if (fingerprints > 1 && mode === 'fingerprint-error') throw new Error('Format unreadable');
@@ -715,15 +722,17 @@ test('Set-cell reports verified readback or an explicit unverified write without
   };
   context.emit = output => { result = JSON.parse(output); };
   try {
-    for (mode of ['success', 'mismatch', 'fingerprint-error', 'write-error']) {
+    for (mode of ['success', 'mismatch', 'neighbor-mismatch', 'fingerprint-error', 'write-error']) {
       value = 'old'; fingerprints = 0; result = null; context.lastError = '';
       context.ARGS = ['set-cell', '--table', '1', '--row', '1', '--col', '1', '--input', 'input.txt',
-        '--expect-path', doc.FullName, '--expect-table-fingerprint', 'before', '--yes'];
+        '--expect-path', doc.FullName, '--expect-table-fingerprint', 'before',
+        '--expect-cell-fingerprint', context.cellFingerprint(1, { row: 1, col: 1 }, context.cellTextScope()), '--yes'];
       if (mode === 'success') {
         context.commandSetCell();
         assert.equal(result.verified, true);
         assert.equal(result.applied, true);
         assert.equal(result.readback.matches_requested, true);
+        assert.equal(result.readback.surrounding_text_unchanged, true);
         assert.equal(result.readback.text_hash, context.textHash('中文\nsecond\n'));
         assert.equal(result.fingerprint, 'after');
         assert.equal(result.document.path, doc.FullName);
@@ -733,10 +742,12 @@ test('Set-cell reports verified readback or an explicit unverified write without
         assert.equal(result.ok, false);
         assert.equal(result.verified, false);
         assert.equal(result.fingerprint, null);
+        assert.equal(result.cell_fingerprint, null);
         assert.equal(result.inspection_complete, false);
         assert.ok(result.errors.length);
         assert.equal(result.applied, mode === 'write-error' ? null : true);
         if (mode === 'mismatch') assert.equal(result.readback.matches_requested, false);
+        if (mode === 'neighbor-mismatch') assert.equal(result.readback.surrounding_text_unchanged, false);
       }
     }
   } finally { Object.assign(context, original); }

@@ -330,11 +330,14 @@ function cleanCellText(value) {
   return normalizeText(value).replace(/\x07/g, "").replace(/\n+$/g, "");
 }
 
-function cellTextForSwap(cell) {
+function rawCellValue(cell) {
   var raw = String(cell.Range.Text);
-  if (!/\r\x07$/.test(raw)) throw new Error("cannot swap cell text: cell terminator was not readable");
-  // Remove only the cell terminator; paragraph and manual-break characters are content.
-  var text = raw.substring(0, raw.length - 2);
+  if (!/\r\x07$/.test(raw)) throw new Error("cell terminator was not readable");
+  return raw.substring(0, raw.length - 2);
+}
+
+function cellTextForSwap(cell) {
+  var text = rawCellValue(cell);
   if (text.indexOf("\x07") >= 0) throw new Error("cannot swap cell text containing nested table cell markers");
   return text;
 }
@@ -375,6 +378,30 @@ function resolveTableCell(table, cellOption, rowOption, colOption, label) {
 
 function cellTargetJson(target) {
   return "{\"cell\":" + (target.cellIndex || "null") + ",\"row\":" + (target.row || "null") + ",\"col\":" + (target.col || "null") + "}";
+}
+
+function cellTextScope(table, cell) {
+  var outer = table.Range, inner = cell.Range;
+  var start = Number(inner.Start), end = Number(inner.End);
+  if (!(Number(outer.Start) <= start && start < end && end <= Number(outer.End))) throw new Error("cell outside its table range");
+  // Word positions can differ from string offsets, particularly around fields and cell markers.
+  var side = outer.Duplicate;
+  side.End = start;
+  var before = side.Start === side.End ? "" : String(side.Text);
+  side.SetRange(end, outer.End);
+  return { before: before, value: rawCellValue(cell), after: side.Start === side.End ? "" : String(side.Text) };
+}
+
+function cellFingerprint(tableIndex, target, scope) {
+  var address = target.cellIndex ? "i" + target.cellIndex : "r" + target.row + "c" + target.col;
+  return "cell-v1:" + tableIndex + ":" + address + ":" + textHash(scope.before, true) + ":"
+    + textHash(scope.value, true) + ":" + textHash(scope.after, true);
+}
+
+function checkCellExpectation(option, expected, actual) {
+  if (normalizeText(String(expected).replace(/\r\n/g, "\n")) !== normalizeText(actual)) {
+    die(option + " does not match this cell; inspect the intended record before writing");
+  }
 }
 
 function borderSignature(borders, borderTypes, errors, label) {
@@ -893,16 +920,33 @@ function selectionSnapshot(doc) {
       supported = Number(cellRange.Start) === start && Number(cellRange.End) === end;
     }
   }
+  var storyType = Number(range.StoryType);
+  var context = "";
+  if (supported) {
+    var paragraphs = range.Paragraphs;
+    var first = paragraphs.First.Range, last = paragraphs.Last.Range;
+    context = q(first.Text);
+    if (first.Start !== last.Start) context += q(last.Text);
+    // A record label can be in another cell of the same table.
+    var tables = range.Tables;
+    if (tables.Count > 0) context += ":table:" + textHash(String(tables(1).Range.Text), true);
+    if (storyType >= 6 && storyType <= 11) {
+      // Identical unlinked headers have story-local offsets. Range.Sections identifies their actual section.
+      var section = Number(range.Sections.First.Index);
+      if (!(section > 0 && isFinite(section))) throw new Error("cannot verify header/footer section");
+      context += ":" + section;
+    }
+  }
   return {
     range: range,
     selectionType: selectionType,
     rangeEditSupported: supported,
-    storyType: Number(range.StoryType),
+    storyType: storyType,
     start: start,
     end: end,
     collapsed: start === end,
     text: text,
-    hash: textHash("selection-type:" + selectionType + "\n" + text)
+    hash: textHash("selection-v2:" + selectionType + ":" + q(text) + ":" + context, true)
   };
 }
 
@@ -940,7 +984,7 @@ function requireExpectedSelection(doc, allowCollapsed) {
     die("selection end changed; rerun selection-info before mutating");
   }
   if (expectedHash && String(expectedHash).toLowerCase() !== snapshot.hash) {
-    die("selection text or type changed; rerun selection-info before mutating");
+    die("selection text, type or paragraph context changed; rerun selection-info before mutating");
   }
   return snapshot;
 }
@@ -981,10 +1025,11 @@ function commandHelp() {
     "  convert-equation --input file [--format latex|linear|word] [--output file]",
     "  enable-track-changes --expect-path file --yes",
     "  disable-track-changes --expect-path file --yes",
-    "  replace-selection --input file --expect-path file --expect-story-type n --expect-start n --expect-end n --expect-selection-hash hash [--track] [--allow-insert] --yes",
+    "  replace-selection --input file --expect-path file --expect-story-type n --expect-start n --expect-end n --expect-selection-hash hash [--track] [--allow-insert] [--replace-paragraph-mark] --yes",
     "  insert-comment --input file --expect-path file --expect-story-type n --expect-start n --expect-end n --expect-selection-hash hash --yes",
     "  create-table --rows n --cols n [--input table.tsv] [--at selection|end] --expect-path file [selection guards when --at selection] --yes",
-    "  set-cell --table n --expect-table-fingerprint hash (--cell n | --row n --col n) --input file --expect-path file --yes",
+    "  tables --table n (--cell n | --row n --col n) [--expect-path file] [--output file]",
+    "  set-cell --table n --expect-table-fingerprint hash --expect-cell-fingerprint hash (--cell n | --row n --col n) [--expect-row-label text] [--expect-column-label text] [--expect-cell-text text] --input file --expect-path file --yes",
     "  swap-cell-text --table n --expect-table-fingerprint hash (--from-cell n | --from-row n --from-col n) (--to-cell n | --to-row n --to-col n) --expect-path file --yes",
     "  insert-row --table n --expect-table-fingerprint hash (--before n | --at-end) --expect-path file --yes",
     "  delete-row --table n --expect-table-fingerprint hash --row n --expect-path file --yes",
@@ -1168,6 +1213,8 @@ function commandTables() {
   var compareXml = hasFlag("--compare-xml");
   if (compareXml && (!tableText || detail !== "full")) die("XML comparison requires a single table with full detail");
   var cellPage = hasFlag("--cell-from") || hasFlag("--cell-max");
+  var withTarget = hasFlag("--cell") || hasFlag("--row") || hasFlag("--col");
+  if (withTarget && (!tableText || detail !== "full")) die("cell target inspection requires --table and full detail");
   if (cellPage && (!tableText || detail !== "text")) die("cell pagination requires --table and --detail text");
   var cellFrom = cellPage ? parsePositiveInt(opt("--cell-from", "1"), "--cell-from") : 1;
   var cellMax = cellPage ? parsePositiveInt(opt("--cell-max", "40"), "--cell-max") : 0;
@@ -1181,7 +1228,7 @@ function commandTables() {
   var returned = tableText ? 1 : (maxText ? parsePositiveInt(maxText, "--max") : count);
   if (returned > count) returned = count;
   var parts = [];
-  var comparisonFailed = false;
+  var queryFailed = false;
   for (var i = first; i < first + returned; i++) {
     var table = tables(i);
     var rowCount = 0;
@@ -1257,10 +1304,22 @@ function commandTables() {
       comparison = readErrors.length ? { candidate: null, stable: null, sourceChars: null, normalizedChars: null,
         elapsedMs: 0, errors: ["legacy table inspection is incomplete; XML comparison skipped"] } : compareTableXml(table);
       if (comparison.errors.length) {
-        comparisonFailed = true;
+        queryFailed = true;
         fingerprint = null;
         for (var e = 0; e < comparison.errors.length; e++) readErrors.push("xml-comparison:" + comparison.errors[e]);
       }
+    }
+    var targetPart = "";
+    if (withTarget) {
+      var target = resolveTableCell(table, "--cell", "--row", "--col", "cell target");
+      var scope = null, token = null;
+      try {
+        scope = cellTextScope(table, target.cell);
+        if (fingerprint !== null && !readErrors.length) token = cellFingerprint(i, target, scope);
+      } catch (targetError) { readErrors.push("cell-target:" + (targetError.message || String(targetError))); }
+      if (token === null) { queryFailed = true; fingerprint = null; }
+      targetPart = ",\"target\":{\"address\":" + cellTargetJson(target) + ",\"text\":" + (scope ? q(normalizeText(scope.value)) : "null")
+        + ",\"fingerprint\":" + (token === null ? "null" : q(token)) + "}";
     }
     parts.push(tableInfo
       + ",\"layout\":" + q(cellPage ? "unverified" : (rectangular ? "rectangular" : "irregular"))
@@ -1271,15 +1330,16 @@ function commandTables() {
       + ",\"read_errors\":" + stringArrayJson(readErrors)
       + ",\"cells\":[" + cells.join(",") + "]"
       + ",\"linear_cells\":[" + linearCells.join(",") + "]"
+      + targetPart
       + (compareXml ? ",\"xml_comparison\":" + xmlComparisonJson(comparison) : "")
       + (cellPage ? ",\"cell_from\":" + cellFrom + ",\"returned_cells\":" + linearCells.length
         + ",\"next_cell\":" + (!readErrors.length && linearCells.length && cellFrom + linearCells.length <= cellCount ? cellFrom + linearCells.length : "null") : "") + "}");
   }
   var detailPart = hasFlag("--detail") ? ",\"detail\":" + q(detail) : "";
-  var payload = "{\"ok\":" + boolJson(!comparisonFailed) + ",\"table_count\":" + count + ",\"returned\":" + returned + detailPart
-    + (cellPage || compareXml ? ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}" : "")
+  var payload = "{\"ok\":" + boolJson(!queryFailed) + ",\"table_count\":" + count + ",\"returned\":" + returned + detailPart
+    + (cellPage || compareXml || withTarget ? ",\"document\":{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}" : "")
     + ",\"tables\":[" + parts.join(",") + "]}";
-  if (comparisonFailed) failJson(payload, 3);
+  if (queryFailed) failJson(payload, 3);
   emit(payload);
 }
 
@@ -1323,16 +1383,25 @@ function commandReplaceSelection() {
   var word = getWord();
   var doc = getMutationDocument(word);
   var selection = requireExpectedSelection(doc, false);
+  var writeRange = selection.range;
+  var replacement = text;
+  var preserveMark = /\n$/.test(selection.text) && !hasFlag("--replace-paragraph-mark");
+  if (preserveMark) {
+    writeRange = writeRange.Duplicate;
+    writeRange.End = selection.end - 1;
+    replacement = String(text).replace(/(?:\r\n|\r|\n)$/, "");
+  }
   var trackBefore = Boolean(doc.TrackRevisions);
   try {
     if (hasFlag("--track")) doc.TrackRevisions = true;
-    selection.range.Text = text;
+    writeRange.Text = replacement;
   } catch (e) {
     var restoreError = "";
     try { doc.TrackRevisions = trackBefore; } catch (restore) { restoreError = "; track state restoration failed: " + restore.message; }
     die("failed to replace selection: " + e.message + restoreError);
   }
   emit("{\"ok\":true,\"action\":\"replace-selection\",\"chars\":" + text.length
+    + ",\"paragraph_mark_preserved\":" + boolJson(preserveMark)
     + ",\"selection_before\":" + selectionSnapshotJson(selection)
     + ",\"track_revisions\":" + q(String(doc.TrackRevisions)) + "}");
 }
@@ -1430,48 +1499,34 @@ function commandCreateTable() {
 function commandSetCell() {
   requireYes();
   var tableIndex = parsePositiveInt(opt("--table", "0"), "--table");
-  var cellText = opt("--cell", "");
-  var rowText = opt("--row", "");
-  var colText = opt("--col", "");
-  if (cellText && (rowText || colText)) die("use either --cell or --row with --col, not both");
-  if (!cellText && (!rowText || !colText)) die("set-cell requires --cell or both --row and --col");
-  var cellIndex = cellText ? parsePositiveInt(cellText, "--cell") : 0;
-  var row = rowText ? parsePositiveInt(rowText, "--row") : 0;
-  var col = colText ? parsePositiveInt(colText, "--col") : 0;
   var input = opt("--input", "");
   var text = readUtf8(input);
   var word = getWord();
   var doc = getMutationDocument(word);
-  var tableCount = Number(doc.Tables.Count);
-  if (tableIndex > tableCount) die("table index out of range; document has " + tableCount + " tables");
-  var table = doc.Tables(tableIndex);
-  requireFingerprint(tableFingerprint(table), "--expect-table-fingerprint", "--allow-unverified-target");
-  var targetCell;
-  if (cellIndex) {
-    var linearCount = Number(table.Range.Cells.Count);
-    if (cellIndex > linearCount) die("cell index out of range; table has " + linearCount + " linear cells");
-    targetCell = table.Range.Cells(cellIndex);
-  } else {
-    var rowCount;
-    var colCount;
-    try { rowCount = Number(table.Rows.Count); } catch (e1) { die("table does not expose regular rows; inspect linear_cells and use --cell: " + e1.message); }
-    try { colCount = Number(table.Columns.Count); } catch (e2) { die("table does not expose regular columns; inspect linear_cells and use --cell: " + e2.message); }
-    if (row > rowCount) die("row index out of range; table has " + rowCount + " rows");
-    if (col > colCount) die("column index out of range; table has " + colCount + " columns");
-    targetCell = table.Cell(row, col);
-  }
+  var table = getGuardedTable(doc, tableIndex);
+  var target = resolveTableCell(table, "--cell", "--row", "--col", "set-cell");
+  var before = cellTextScope(table, target.cell);
+  requireFingerprint(cellFingerprint(tableIndex, target, before), "--expect-cell-fingerprint", "--allow-unverified-target");
+  var rowLabel = opt("--expect-row-label", null), columnLabel = opt("--expect-column-label", null), oldText = opt("--expect-cell-text", null);
+  if (rowLabel !== null) checkCellExpectation("--expect-row-label", rowLabel, rawCellValue(table.Cell(target.cell.RowIndex, 1)));
+  if (columnLabel !== null) checkCellExpectation("--expect-column-label", columnLabel, rawCellValue(table.Cell(1, target.cell.ColumnIndex)));
+  if (oldText !== null) checkCellExpectation("--expect-cell-text", oldText, before.value);
   var documentJson = "{\"name\":" + q(doc.Name) + ",\"path\":" + q(safeDocPath(doc)) + "}";
-  var applied = false, verified = false, fingerprint = null, readback = "null", errors = [];
-  try { setCellText(targetCell, text); applied = true; }
+  var applied = false, verified = false, fingerprint = null, nextCell = null, readback = "null", errors = [];
+  try { setCellText(target.cell, text); applied = true; }
   catch (e3) { applied = null; errors.push("write:" + (e3.message || String(e3))); }
   if (applied === true) {
     try {
-      var raw = String(targetCell.Range.Text);
-      if (!/\r\x07$/.test(raw)) throw new Error("cell terminator was not readable");
-      var actual = normalizeText(raw.substring(0, raw.length - 2));
+      var addressedCell = target.cellIndex ? table.Range.Cells(target.cellIndex) : table.Cell(target.row, target.col);
+      var after = cellTextScope(table, addressedCell);
+      var actual = normalizeText(after.value);
       var matches = actual === normalizeText(text.replace(/\r\n/g, "\n"));
-      readback = "{\"matches_requested\":" + boolJson(matches) + ",\"chars\":" + actual.length + ",\"text_hash\":" + q(textHash(actual)) + "}";
+      var preserved = before.before === after.before && before.after === after.after;
+      readback = "{\"matches_requested\":" + boolJson(matches) + ",\"surrounding_text_unchanged\":" + boolJson(preserved)
+        + ",\"chars\":" + actual.length + ",\"text_hash\":" + q(textHash(actual)) + "}";
       if (!matches) errors.push("readback:cell text differs from requested text");
+      if (!preserved) errors.push("readback:table text outside the target cell changed");
+      nextCell = cellFingerprint(tableIndex, target, after);
     } catch (readError) { errors.push("readback:" + (readError.message || String(readError))); }
     try { fingerprint = tableFingerprint(table, errors); }
     catch (fingerprintError) { errors.push("fingerprint:" + (fingerprintError.message || String(fingerprintError))); }
@@ -1479,10 +1534,11 @@ function commandSetCell() {
   }
   // An interrupted write may already have changed the document. Never return a retry guard.
   var payload = "{\"ok\":" + boolJson(verified) + ",\"action\":\"set-cell\",\"table\":" + tableIndex
-    + ",\"cell\":" + (cellIndex || "null") + ",\"row\":" + (row || "null") + ",\"col\":" + (col || "null")
+    + ",\"cell\":" + (target.cellIndex || "null") + ",\"row\":" + (target.row || "null") + ",\"col\":" + (target.col || "null")
     + ",\"chars\":" + text.length + ",\"document\":" + documentJson + ",\"applied\":" + (applied === null ? "null" : boolJson(applied))
     + ",\"verified\":" + boolJson(verified) + ",\"inspection_complete\":" + boolJson(verified) + ",\"readback\":" + readback
-    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null") + "}";
+    + ",\"errors\":" + stringArrayJson(errors) + ",\"fingerprint\":" + (verified ? q(fingerprint) : "null")
+    + ",\"cell_fingerprint\":" + (verified ? q(nextCell) : "null") + "}";
   if (!verified) failJson(payload, 3);
   emit(payload);
 }

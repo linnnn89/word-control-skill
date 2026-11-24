@@ -513,7 +513,7 @@ function exerciseXmlMutationDetection() {
     function inspect(name) {
       var selectionStart = Number(word.Selection.Start), selectionEnd = Number(word.Selection.End), saved = Boolean(sample.Saved);
       var footprint = captureInspectionFootprint(sample, table, false);
-      var result = runJson(["tables", "--table", "1", "--compare-xml", "--expect-path", path], "xml-" + name + ".json");
+      var result = runJson(["tables", "--table", "1", "--cell", "1", "--compare-xml", "--expect-path", path], "xml-" + name + ".json");
       var comparison = result.tables[0].xml_comparison;
       assertTrue(comparison.diagnostic_only === true && comparison.stable_repeat === true && comparison.errors.length === 0, "XML comparison did not complete: " + name);
       assertTrue(/^xml-v1:[0-9a-f]{8}$/.test(comparison.candidate_hash), "XML candidate hash has no version");
@@ -526,10 +526,10 @@ function exerciseXmlMutationDetection() {
     var initial = inspect("initial");
     var input = fso.BuildPath(testDir, "xml-cell.txt"); writeUtf8(input, "changed");
     requireFailure(["set-cell", "--table", "1", "--cell", "1", "--input", input,
-      "--expect-table-fingerprint", lastCandidate, "--expect-path", path, "--yes"]);
+      "--expect-table-fingerprint", lastCandidate, "--expect-cell-fingerprint", initial.target.fingerprint, "--expect-path", path, "--yes"]);
     assertTrue(cleanWordCell(table.Cell(1, 1)) === "A", "XML candidate authorized a write");
     runJson(["set-cell", "--table", "1", "--cell", "1", "--input", input,
-      "--expect-table-fingerprint", initial.fingerprint, "--expect-path", path, "--yes"], "xml-set-cell.json");
+      "--expect-table-fingerprint", initial.fingerprint, "--expect-cell-fingerprint", initial.target.fingerprint, "--expect-path", path, "--yes"], "xml-set-cell.json");
     inspect("text");
     table.Cell(1, 1).Shading.BackgroundPatternColor = 255; inspect("shading");
     table.Cell(1, 1).Borders(-1).LineStyle = 1; table.Cell(1, 1).Borders(-1).LineWidth = 8; inspect("border");
@@ -550,13 +550,125 @@ function exerciseXmlMutationDetection() {
   }
 }
 
+function exerciseRowTargetGuards() {
+  var previous = word.ActiveDocument, sample = word.Documents.Add();
+  var path = fso.BuildPath(testDir, "row-targets.docx");
+  var input = fso.BuildPath(testDir, "row-target-input.txt");
+  function inspectSelection(name) {
+    var s = runJson(["selection-info", "--expect-path", path], name + ".json").selection;
+    return ["--expect-story-type", String(s.story_type), "--expect-start", String(s.start),
+      "--expect-end", String(s.end), "--expect-selection-hash", s.text_hash];
+  }
+  function replaceAt(guard) {
+    return ["replace-selection", "--input", input, "--yes", "--expect-path", path].concat(guard);
+  }
+  function inspectCell(row, name) {
+    return runJson(["tables", "--table", "1", "--row", String(row), "--col", "2", "--expect-path", path], name + ".json").tables[0];
+  }
+  function writeCell(row, tableGuard, cellGuard) {
+    var args = ["set-cell", "--table", "1", "--row", String(row), "--col", "2", "--expect-table-fingerprint", tableGuard,
+      "--expect-path", path, "--input", input, "--yes"];
+    return cellGuard ? args.concat(["--expect-cell-fingerprint", cellGuard]) : args;
+  }
+  try {
+    sample.Content.Text = "A001 | PENDING\rB002 | PENDING\rTARGET\rNEIGHBOR\rTAIL\r";
+    var table = sample.Tables.Add(sample.Range(sample.Content.End - 1, sample.Content.End - 1), 4, 2);
+    var keys = ["ID", "A", "B", "C"];
+    for (var i = 0; i < keys.length; i++) {
+      table.Cell(i + 1, 1).Range.Text = keys[i];
+      table.Cell(i + 1, 2).Range.Text = i === 0 ? "STATUS" : "PENDING";
+    }
+    sample.SaveAs2(path, 16);
+    sample.Close(false);
+    sample = word.Documents.Open(path, false, false, false);
+    table = sample.Tables(1);
+    var found = inspectCell(3, "row-initial");
+    assertTrue(found.target && found.target.fingerprint && found.cells[2][0] === "B" && found.cells[0][1] === "STATUS",
+      "cell inspection must bind the chosen record and column");
+    var inserted = runJson(["insert-row", "--table", "1", "--before", "2", "--expect-table-fingerprint", found.fingerprint,
+      "--expect-path", path, "--yes"], "row-inserted.json");
+    assertTrue(inserted.verified && cleanWordCell(table.Cell(4, 1)) === "B", "B did not move to row 4");
+    writeUtf8(input, "CHECKED");
+    var before = String(sample.Content.Text);
+    requireFailure(writeCell(3, inserted.fingerprint, null));
+    requireFailure(writeCell(3, inserted.fingerprint, found.target.fingerprint));
+    var moved = inspectCell(4, "row-relocated");
+    requireFailure(writeCell(3, moved.fingerprint, moved.target.fingerprint));
+    var labels = ["--expect-row-label", "B", "--expect-column-label", "STATUS", "--expect-cell-text", "PENDING"];
+    var wrong = inspectCell(3, "row-fresh-wrong-target");
+    requireFailure(writeCell(3, wrong.fingerprint, wrong.target.fingerprint).concat(labels));
+    requireFailure(writeCell(4, moved.fingerprint, moved.target.fingerprint).concat(["--expect-column-label", "ID"]));
+    requireFailure(writeCell(4, moved.fingerprint, moved.target.fingerprint).concat(["--expect-cell-text", "CHECKED"]));
+    assertTrue(String(sample.Content.Text) === before, "stale or mismatched cell target changed document text");
+    var cell = runJson(writeCell(4, moved.fingerprint, moved.target.fingerprint).concat(labels), "row-updated.json");
+    assertTrue(cell.verified && cell.readback.surrounding_text_unchanged && cleanWordCell(table.Cell(4, 2)) === "CHECKED",
+      "relocated cell was not verified");
+    assertTrue(String(sample.Content.Text) === before.replace("B\r\x07PENDING", "B\r\x07CHECKED"),
+      "a neighboring row or surrounding text changed");
+
+    sample.Range(7, 14).Select();
+    var original = inspectSelection("row-selection");
+    sample.Range(0, 4).Text = "B002";
+    sample.Range(15, 19).Text = "A001";
+    before = String(sample.Content.Text);
+    assertTrue(Number(sample.ActiveWindow.Selection.Start) === 7 && String(sample.ActiveWindow.Selection.Range.Text) === "PENDING",
+      "fixture failed to retain the same selection");
+    requireFailure(replaceAt(original));
+    assertTrue(String(sample.Content.Text) === before, "an old selection edited a different record");
+    sample.Range(22, 29).Select();
+    runJson(replaceAt(inspectSelection("row-selection-refreshed")), "row-selection-written.json");
+    assertTrue(String(sample.Content.Text) === before.replace("A001 | PENDING", "A001 | CHECKED"), "wrong paragraph changed");
+
+    sample.Paragraphs(3).Range.Select();
+    var count = Number(sample.Paragraphs.Count);
+    before = String(sample.Content.Text);
+    writeUtf8(input, "EDITED\r\n");
+    var changed = runJson(replaceAt(inspectSelection("row-paragraph")), "row-paragraph-written.json");
+    assertTrue(changed.paragraph_mark_preserved && Number(sample.Paragraphs.Count) === count
+      && String(sample.Content.Text) === before.replace("TARGET\r", "EDITED\r"), "trailing newline duplicated or joined a paragraph");
+    sample.Paragraphs(3).Range.Select();
+    writeUtf8(input, "PLAIN");
+    runJson(replaceAt(inspectSelection("row-paragraph-plain")), "row-paragraph-plain-written.json");
+    var expected = before.replace("TARGET\r", "PLAIN\r");
+    assertTrue(String(sample.Content.Text) === expected && Number(sample.Paragraphs.Count) === count, "plain text joined the neighbor");
+    sample.Save();
+    sample.Close(false);
+    sample = word.Documents.Open(path, false, false, false);
+    assertTrue(String(sample.Content.Text) === expected && Number(sample.Paragraphs.Count) === count,
+      "reopened document differs from the checked records and paragraph boundaries");
+    sample.Paragraphs(3).Range.Select();
+    writeUtf8(input, "JOIN");
+    runJson(replaceAt(inspectSelection("row-intentional-join")).concat(["--replace-paragraph-mark"]), "row-joined.json");
+    assertTrue(String(sample.Content.Text) === expected.replace("PLAIN\r", "JOIN")
+      && Number(sample.Paragraphs.Count) === count - 1, "explicit paragraph-mark replacement failed");
+
+    var atEnd = sample.Content.End - 1;
+    sample.Sections.Add(sample.Range(atEnd, atEnd));
+    var h1 = sample.Sections(1).Headers(1), h2 = sample.Sections(2).Headers(1);
+    h2.LinkToPrevious = false;
+    h1.Range.Text = "SAME"; h2.Range.Text = "SAME";
+    var header = h1.Range; header.End = header.Start + 4; header.Select();
+    var headerGuard = inspectSelection("row-first-header");
+    header = h2.Range; header.End = header.Start + 4; header.Select();
+    before = String(sample.Content.Text);
+    requireFailure(replaceAt(headerGuard));
+    assertTrue(String(h1.Range.Text) === "SAME\r" && String(h2.Range.Text) === "SAME\r" && String(sample.Content.Text) === before,
+      "switched header guard changed either section or the main story");
+  } finally {
+    if (sample) sample.Close(false);
+    previous.Activate();
+  }
+}
+
 function exerciseAdvancedTable(path, tableIndex, fingerprint, prefix) {
   var cellInput = fso.BuildPath(testDir, prefix + "-advanced-cell.txt");
   writeUtf8(cellInput, "CENTER");
+  var inspected = runJson(["tables", "--table", String(tableIndex), "--row", "2", "--col", "2", "--expect-path", path],
+    prefix + "-advanced-cell-target.json").tables[0];
 
   var setCell = runJson([
     "set-cell", "--table", String(tableIndex), "--expect-table-fingerprint", String(fingerprint),
-    "--row", "2", "--col", "2", "--input", cellInput, "--expect-path", path, "--yes"
+    "--row", "2", "--col", "2", "--expect-cell-fingerprint", inspected.target.fingerprint, "--input", cellInput, "--expect-path", path, "--yes"
   ], prefix + "-advanced-set-cell.json");
   assertTrue(setCell.applied === true && setCell.verified === true && setCell.inspection_complete === true, "set-cell did not verify the write");
   assertTrue(setCell.readback.matches_requested === true && setCell.readback.chars === 6, "set-cell readback did not match CENTER");
@@ -676,7 +788,7 @@ var word = null;
 var doc = null;
 var failure = null;
 var savedWordOptions = {};
-var successPayload = '{"ok":true,"guarded_selection":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"cell_text_fidelity":true,"verified_cell_results":true,"verified_structure_results":true,"verified_deletion_results":true,"backup":true,"pdf":true,"close":true}';
+var successPayload = '{"ok":true,"guarded_selection":true,"row_target_guards":true,"guarded_tables":true,"advanced_tables":true,"guarded_equations":true,"scoped_inspection":true,"cell_text_fidelity":true,"verified_cell_results":true,"verified_structure_results":true,"verified_deletion_results":true,"backup":true,"pdf":true,"close":true}';
 
 function exerciseScopedInspection() {
   var queryDoc = word.Documents.Add();
@@ -780,14 +892,16 @@ function exerciseScopedInspection() {
     assertTrue(Number(word.Selection.Start) === selectionStart && Number(word.Selection.End) === selectionEnd, "read-only inspection changed the selection");
     assertTrue(String(word.ActiveDocument.FullName).toLowerCase() === queryPath.toLowerCase(), "read-only inspection switched the active document");
     var cellInput = fso.BuildPath(testDir, "verified-multiline.txt");
+    var inspectedCell = runJson(["tables", "--table", "1", "--row", "1", "--col", "1", "--expect-path", queryPath],
+      "verified-multiline-target.json").tables[0].target;
     writeUtf8(cellInput, "\u4e2d\u6587\r\nsecond\n");
     var multiline = runJson(["set-cell", "--table", "1", "--row", "1", "--col", "1", "--input", cellInput,
-      "--expect-path", queryPath, "--expect-table-fingerprint", all.tables[0].fingerprint, "--yes"], "verified-multiline.json");
+      "--expect-path", queryPath, "--expect-table-fingerprint", all.tables[0].fingerprint, "--expect-cell-fingerprint", inspectedCell.fingerprint, "--yes"], "verified-multiline.json");
     assertTrue(multiline.verified && multiline.readback.matches_requested, "multiline receipt rejected Word newline normalization");
     assertTrue(String(queryDoc.Tables(1).Cell(1, 1).Range.Text) === "\u4e2d\u6587\rsecond\r\r\x07", "multiline cell lost content or trailing paragraph");
     writeUtf8(cellInput, "");
     var emptyCell = runJson(["set-cell", "--table", "1", "--row", "1", "--col", "1", "--input", cellInput,
-      "--expect-path", queryPath, "--expect-table-fingerprint", multiline.fingerprint, "--yes"], "verified-empty-cell.json");
+      "--expect-path", queryPath, "--expect-table-fingerprint", multiline.fingerprint, "--expect-cell-fingerprint", multiline.cell_fingerprint, "--yes"], "verified-empty-cell.json");
     assertTrue(emptyCell.verified && emptyCell.readback.chars === 0, "empty cell was not verified");
   } finally {
     if (queryFinder) for (var setting in originalFind) queryFinder[setting] = originalFind[setting];
@@ -1035,6 +1149,7 @@ try {
   doc = word.Documents.Open(docPath, false, false, false);
   doc.Activate();
   assertTrue(String(doc.Content.Text) === seedText, "Reopening the synthetic fixture changed its control characters");
+  exerciseRowTargetGuards();
   exerciseXmlMutationDetection();
   exerciseCellTextFidelity();
   exerciseVerifiedCellResults();
